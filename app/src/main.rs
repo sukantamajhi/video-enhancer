@@ -3,6 +3,9 @@
 mod ai;
 mod grade;
 mod media;
+mod montage;
+mod montage_ui;
+mod music;
 mod sample;
 
 use std::path::PathBuf;
@@ -27,6 +30,13 @@ enum Msg {
     Suggestion(Result<ai::Suggestion, String>),
     Export(f32, String),
     ExportDone(Result<Vec<PathBuf>, String>),
+    Montage(montage_ui::Event),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Single,
+    Montage,
 }
 
 /// Lets worker threads send a message and wake the window.
@@ -125,6 +135,8 @@ struct App {
     status: String,
     status_is_error: bool,
     shot: Option<(PathBuf, u32)>,
+    mode: Mode,
+    mon: montage_ui::State,
 }
 
 fn main() -> eframe::Result {
@@ -203,6 +215,8 @@ impl App {
             status: String::new(),
             status_is_error: false,
             shot: None,
+            mode: if std::env::var_os("VE_MONTAGE").is_some() { Mode::Montage } else { Mode::Single },
+            mon: montage_ui::State::new(),
         };
         app.use_sample();
         app.status = if app.tools.is_some() {
@@ -535,6 +549,7 @@ impl App {
                     e.label = label;
                 }
             }
+            Msg::Montage(event) => self.montage_event(event),
             Msg::ExportDone(result) => {
                 self.export = None;
                 match result {
@@ -994,10 +1009,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain();
-        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| Some(f.path().to_path_buf()))) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if self.mode == Mode::Montage {
+            if !dropped.is_empty() {
+                self.add_clips(dropped);
+            }
+        } else if let Some(path) = dropped.into_iter().next() {
             self.open(path);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && !ctx.egui_wants_keyboard_input() {
+        if self.mode == Mode::Single && ctx.input(|i| i.key_pressed(egui::Key::Space)) && !ctx.egui_wants_keyboard_input() {
             self.toggle_play();
         }
         self.refresh(&ctx);
@@ -1006,19 +1026,32 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Video Enhancer").strong().size(18.0));
                 ui.separator();
-                if ui.button("Open video…").clicked()
-                    && let Some(path) = rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v", "mts", "wmv"]).pick_file()
-                {
-                    self.open(path);
+                for (mode, name) in [(Mode::Single, "Single video"), (Mode::Montage, "Montage")] {
+                    if ui.selectable_value(&mut self.mode, mode, name).clicked() {
+                        self.player = None;
+                        self.status_is_error = false;
+                        self.status = match mode {
+                            Mode::Montage => "Add several clips (or drop them here), choose your options, then press Plan with AI.".into(),
+                            Mode::Single => "Drop a video here, or press Open video.".into(),
+                        };
+                    }
                 }
-                if self.source.is_some() && ui.button("Use sample picture").clicked() {
-                    self.source = None;
-                    self.player = None;
-                    self.use_sample();
-                }
-                ui.separator();
-                for (mode, name) in [(Compare::Split, "Slide"), (Compare::Side, "Side by side"), (Compare::Before, "Before"), (Compare::After, "After")] {
-                    ui.selectable_value(&mut self.compare, mode, name);
+                if self.mode == Mode::Single {
+                    ui.separator();
+                    if ui.button("Open video…").clicked()
+                        && let Some(path) = rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v", "mts", "wmv"]).pick_file()
+                    {
+                        self.open(path);
+                    }
+                    if self.source.is_some() && ui.button("Use sample picture").clicked() {
+                        self.source = None;
+                        self.player = None;
+                        self.use_sample();
+                    }
+                    ui.separator();
+                    for (mode, name) in [(Compare::Split, "Slide"), (Compare::Side, "Side by side"), (Compare::Before, "Before"), (Compare::After, "After")] {
+                        ui.selectable_value(&mut self.compare, mode, name);
+                    }
                 }
             });
         });
@@ -1026,16 +1059,20 @@ impl eframe::App for App {
             let colour = if self.status_is_error { Color32::from_rgb(255, 120, 110) } else { ui.visuals().text_color() };
             ui.label(RichText::new(&self.status).color(colour));
         });
-        egui::Panel::bottom("timeline").show(ui, |ui| self.timeline(ui));
-        egui::Panel::left("controls").default_size(330.0).min_size(280.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
-        });
-        egui::Panel::right("export").default_size(250.0).min_size(220.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.export_panel(ui));
-        });
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.centered_and_justified(|ui| self.preview(ui));
-        });
+        if self.mode == Mode::Montage {
+            egui::CentralPanel::default().show(ui, |ui| self.montage_screen(ui));
+        } else {
+            egui::Panel::bottom("timeline").show(ui, |ui| self.timeline(ui));
+            egui::Panel::left("controls").default_size(330.0).min_size(280.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
+            });
+            egui::Panel::right("export").default_size(250.0).min_size(220.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.export_panel(ui));
+            });
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.centered_and_justified(|ui| self.preview(ui));
+            });
+        }
 
         if self.confirm_omni {
             egui::Window::new("Send a sample to Gemini Omni?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| {
@@ -1070,7 +1107,7 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
-        if self.player.is_some() || self.ai_busy.is_some() || self.export.is_some() {
+        if self.player.is_some() || self.ai_busy.is_some() || self.export.is_some() || self.mon.working() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

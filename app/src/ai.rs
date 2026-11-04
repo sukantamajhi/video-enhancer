@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::grade::{self, Grade, LearnedLook};
 use crate::media::{self, Frame, GrabOptions, Tools};
+use crate::montage::{Cut, Style};
 
 pub const GEMINI_MODEL: &str = "gemini-omni-1.1-flash";
 pub const OPENAI_MODELS: [(&str, &str); 3] = [
@@ -288,8 +289,145 @@ pub fn openai_suggest(key: &str, model: &str, frames: &[Frame], goal: &str) -> R
     })
 }
 
+// -------------------------------------------------------------------- montage
+
+/// What the AI is told about one clip.
+pub struct ClipBrief {
+    pub name: String,
+    pub duration: f64,
+    pub frames: Vec<(f64, Frame)>,
+    /// Seconds where the clip is busiest, measured on this computer.
+    pub peaks: Vec<f64>,
+}
+
+pub struct AiPlan {
+    pub title: String,
+    pub music_query: String,
+    pub tempo: String,
+    pub cuts: Vec<Cut>,
+}
+
+fn plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": { "type": "string", "description": "A short, catchy title for the montage, 2-5 words" },
+            "music_query": { "type": "string", "description": "One or two plain words for the music mood or genre, for example 'upbeat' or 'cinematic travel'" },
+            "tempo": { "type": "string", "enum": ["slow", "medium", "fast"] },
+            "cuts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "clip": { "type": "integer", "description": "Clip number as given, starting at 0" },
+                        "start": { "type": "number", "description": "Start second inside that clip" },
+                        "end": { "type": "number", "description": "End second inside that clip" },
+                        "score": { "type": "number", "description": "0 to 1, how good this moment is" },
+                        "why": { "type": "string", "description": "A few words on why it is worth keeping" },
+                    },
+                    "required": ["clip", "start", "end", "score", "why"],
+                    "additionalProperties": false,
+                },
+            },
+        },
+        "required": ["title", "music_query", "tempo", "cuts"],
+        "additionalProperties": false,
+    })
+}
+
+fn parse_plan(parsed: &Value) -> Result<AiPlan, String> {
+    let cuts: Vec<Cut> = parsed["cuts"]
+        .as_array()
+        .ok_or("The plan had no cuts in it.")?
+        .iter()
+        .filter_map(|c| {
+            Some(Cut {
+                clip: c["clip"].as_u64()? as usize,
+                start: c["start"].as_f64()?,
+                end: c["end"].as_f64()?,
+                score: c["score"].as_f64().unwrap_or(0.5) as f32,
+                why: c["why"].as_str().unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    if cuts.is_empty() {
+        return Err("The AI didn't pick any moments. Try again.".into());
+    }
+    Ok(AiPlan {
+        title: parsed["title"].as_str().unwrap_or("").trim().to_string(),
+        music_query: parsed["music_query"].as_str().unwrap_or("upbeat").trim().to_string(),
+        tempo: parsed["tempo"].as_str().unwrap_or("medium").to_string(),
+        cuts,
+    })
+}
+
+/// Shows pictures from every clip to an OpenAI model and gets back the best moments to keep.
+pub fn openai_plan(key: &str, model: &str, clips: &[ClipBrief], style: Style, target: f64, notes: &str) -> Result<AiPlan, String> {
+    let (min, max) = style.cut_range();
+    let how = match style {
+        Style::Highlights => "a highlight reel: only the most exciting, beautiful or funny moments, mixed across all the clips",
+        Style::BeatSync => "a fast beat-synced montage: short punchy moments with clear movement, building toward the best one",
+        Style::Story => "a story: the clips in order, longer moments that show what happened, skipping dull stretches",
+    };
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": format!(
+            "You are a video editor for YouTube. Below are {} clips, each shown as pictures taken at the listed seconds. \
+             Make {how}. The finished video should be about {target:.0} seconds, so choose enough moments to add up to roughly {:.0} seconds in total. \
+             Each moment must be between {min:.1} and {max:.1} seconds long and must lie inside its clip. Avoid repeating the same moment. \
+             Prefer moments with clear subjects, good light and action; avoid blurry, empty or shaky stretches. {}",
+            clips.len(),
+            target * 1.1,
+            if notes.trim().is_empty() { String::new() } else { format!("The creator wants: {}.", notes.trim()) },
+        ),
+    })];
+    for (i, clip) in clips.iter().enumerate() {
+        let times: Vec<String> = clip.frames.iter().map(|(t, _)| format!("{t:.0}")).collect();
+        let peaks: Vec<String> = clip.peaks.iter().map(|t| format!("{t:.0}")).collect();
+        content.push(json!({
+            "type": "input_text",
+            "text": format!("Clip {i}: \"{}\", {:.0} seconds long. Pictures at seconds: {}. Busiest moments (movement and sound), in seconds: {}.", clip.name, clip.duration, times.join(", "), peaks.join(", ")),
+        }));
+        for (_, frame) in &clip.frames {
+            content.push(json!({ "type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", STANDARD.encode(encode_jpeg(frame, 78)?)), "detail": "low" }));
+        }
+    }
+    let body = json!({
+        "model": model,
+        "input": [{ "role": "user", "content": content }],
+        "text": { "format": { "type": "json_schema", "name": "montage_plan", "strict": true, "schema": plan_schema() } },
+    });
+    let reply = post_json("https://api.openai.com/v1/responses", &[("authorization", format!("Bearer {key}"))], &body, 300)?;
+    let parsed: Value = serde_json::from_str(&openai_text(&reply)?).map_err(|e| format!("The plan wasn't valid: {e}"))?;
+    parse_plan(&parsed)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_schema_is_strict_and_complete() {
+        let s = plan_schema();
+        let item = &s["properties"]["cuts"]["items"];
+        for object in [&s, item] {
+            let mut props: Vec<&str> = object["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+            let mut required: Vec<&str> = object["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            props.sort();
+            required.sort();
+            assert_eq!(props, required);
+            assert_eq!(object["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn plan_is_read_and_bad_cuts_are_skipped() {
+        let plan = parse_plan(&json!({ "title": " Road Trip ", "music_query": "upbeat", "tempo": "fast", "cuts": [
+            { "clip": 0, "start": 1.5, "end": 5.0, "score": 0.9, "why": "sunset" },
+            { "clip": "x", "start": 1.0, "end": 2.0, "score": 0.1, "why": "broken" },
+        ] })).unwrap();
+        assert_eq!((plan.title.as_str(), plan.cuts.len(), plan.cuts[0].end), ("Road Trip", 1, 5.0));
+        assert!(parse_plan(&json!({ "cuts": [] })).is_err());
+    }
+
     use super::*;
 
     #[test]

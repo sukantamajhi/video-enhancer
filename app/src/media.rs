@@ -32,7 +32,7 @@ pub fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(std::env::temp_dir, |d| Path::new(&d).join(".video-enhancer"))
 }
 
-fn hidden(program: &Path) -> Command {
+pub fn hidden(program: &Path) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
@@ -218,12 +218,12 @@ impl Default for Finish {
     }
 }
 
-fn even(v: f64) -> u32 {
+pub fn even(v: f64) -> u32 {
     ((v / 2.0).round() as u32).max(1) * 2
 }
 
 /// Turns any source into the plain video colour the colour table expects.
-fn base_filters(p: &Probe) -> Vec<String> {
+pub fn base_filters(p: &Probe) -> Vec<String> {
     if p.hdr {
         vec!["zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p".into()]
     } else if p.untagged {
@@ -468,7 +468,7 @@ pub fn action_at(points: &[(f64, f32)], t: f64) -> f32 {
     points.last().map_or(0.5, |p| p.1)
 }
 
-fn action_expression(points: &[(f64, f32)], start: f64) -> String {
+pub fn action_expression(points: &[(f64, f32)], start: f64) -> String {
     let t = format!("(t+{start:.3})");
     let mut terms = Vec::new();
     for pair in points.windows(2) {
@@ -510,7 +510,7 @@ pub struct ExportJob {
     pub output: PathBuf,
 }
 
-const TAGS: &str = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv";
+pub const TAGS: &str = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv";
 
 fn export_graph(job: &ExportJob) -> String {
     let p = &job.probe;
@@ -553,7 +553,7 @@ fn export_graph(job: &ExportJob) -> String {
 }
 
 /// Stops the running program when the cancel flag is raised; returns whether it finished well.
-fn watch(mut child: Child, cancel: &AtomicBool, total: f64, progress: &mut impl FnMut(f32)) -> Result<(), String> {
+pub fn watch(mut child: Child, cancel: &AtomicBool, total: f64, progress: &mut impl FnMut(f32)) -> Result<(), String> {
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let errors = std::thread::spawn(move || {

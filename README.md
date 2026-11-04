@@ -23,9 +23,27 @@ The first time, press **Download video tools** (FFmpeg, about 110 MB, checked ag
 
 API keys are stored in the system credential store (or read from `GEMINI_API_KEY` / `OPENAI_API_KEY`).
 
+## Montage (several clips into one video)
+
+Switch to **Montage** at the top, then add up to 12 clips (for example five 2-minute clips).
+
+1. **Style** (dropdown): *Highlight reel*, *Beat-synced to music*, or *Story / vlog edit* (keeps your order, fades through black, adds a title).
+2. **Length**: you set it (30 s up to 15 min). It exports **16:9 and 9:16**.
+3. **Sound** (dropdown): music with the original sound underneath (the music dips when people speak), original sound only, or music only.
+4. **Music**: *Find free music for me* searches ccMixter, a Creative Commons catalogue of music made for reuse in videos (no key needed), using a mood the AI picks from your footage; instrumentals come first because they sit better under speech, or *Use my own file*. Only CC0, public-domain, CC BY and CC BY-SA tracks are used (nothing marked NC or ND), and a credits text file (`..._music_credits.txt`) with a ready-to-paste credit line is saved next to the montage.
+5. **Plan with AI**: OpenAI sees about 10 small pictures per clip, plus where each clip is busiest (movement and loudness, measured locally), and proposes the moments to keep. Your video files are never uploaded. You see the cut list and can untick moments.
+6. **Make montage**: FFmpeg cuts your real footage together, grades each clip separately so different cameras and lighting match, and renders both shapes. A beat-synced edit finds the song's tempo and lands every cut on a beat.
+
+Notes:
+
+- ccMixter tracks are mostly CC BY (credit needed). Always paste the saved credit line into your video description. Openverse is tried as an extra source, but it is behind a bot challenge that often turns automated requests away, so it is optional.
+- ccMixter is a small community server: searches take 5-15 seconds, and a failed search can simply be retried with **Search again**.
+- The story title needs a system font (Arial on Windows); without one the title is skipped.
+- Pasting a YouTube link to rip music is deliberately not supported: it breaks YouTube's terms and can't make a track safe to use.
+
 ## Tests
 
-`cargo test` runs the colour, AI-reply and parsing tests. If FFmpeg is installed it also runs the end-to-end test that exports a **2-minute** video in every shape; without FFmpeg those tests skip themselves.
+`cargo test` runs the colour, AI-reply and parsing tests. If FFmpeg is installed it also runs the end-to-end tests that export a **2-minute** video in every shape and build montages in every style, sound mode and shape; without FFmpeg those tests skip themselves.
 
 ## Ideas for what to add next
 
