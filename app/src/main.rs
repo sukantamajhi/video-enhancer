@@ -7,6 +7,7 @@ mod montage;
 mod montage_ui;
 mod music;
 mod sample;
+mod store;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use eframe::egui::{self, Color32, RichText, pos2, vec2};
 use grade::{Grade, LOOKS, LUT_SIZE, LearnedLook, Lut};
+use serde::{Deserialize, Serialize};
 use media::{ExportJob, Finish, Frame, Framing, GrabOptions, Player, Probe, Shape, Tools};
 
 /// What a background thread can tell the window.
@@ -26,14 +28,15 @@ enum Msg {
     Analysed(Result<Grade, String>),
     Action(Result<Vec<(f64, f32)>, String>),
     Note(String),
-    Omni(Result<LearnedLook, String>),
-    Suggestion(Result<ai::Suggestion, String>),
+    /// The second field is true when a saved answer was reused (nothing was sent or paid for).
+    Omni(Result<LearnedLook, String>, bool),
+    Suggestion(Result<ai::Suggestion, String>, bool),
     Export(f32, String),
     ExportDone(Result<Vec<PathBuf>, String>),
     Montage(montage_ui::Event),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum Mode {
     Single,
     Montage,
@@ -61,12 +64,64 @@ enum Compare {
     After,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum VerticalFraming {
     Centre,
     Manual,
     Follow,
     Blur,
+}
+
+/// Everything remembered about one video, so reopening it (even after a restart)
+/// brings back the grade and any AI results without paying for them again.
+#[derive(Serialize, Deserialize)]
+struct VideoSession {
+    grade: Grade,
+    auto_base: Grade,
+    learned: Option<LearnedLook>,
+    look: Option<usize>,
+    finish: Finish,
+    trim: (f64, f64),
+    t: f64,
+    ai_result: String,
+    framing: VerticalFraming,
+    manual_x: f32,
+    action: Option<Vec<(f64, f32)>>,
+}
+
+/// Choices that carry over from one run to the next.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    last_video: Option<PathBuf>,
+    montage: bool,
+    openai_model: usize,
+    style_notes: String,
+    reuse_ai: bool,
+    wants_wide: bool,
+    wide_height: u32,
+    wants_vertical: bool,
+    wants_lut: bool,
+    wants_thumb: bool,
+    out_dir: Option<PathBuf>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            last_video: None,
+            montage: false,
+            openai_model: 0,
+            style_notes: ai::DEFAULT_STYLE.to_string(),
+            reuse_ai: true,
+            wants_wide: true,
+            wide_height: 0,
+            wants_vertical: true,
+            wants_lut: false,
+            wants_thumb: true,
+            out_dir: None,
+        }
+    }
 }
 
 struct Source {
@@ -137,6 +192,10 @@ struct App {
     shot: Option<(PathBuf, u32)>,
     mode: Mode,
     mon: montage_ui::State,
+    video_fp: Option<String>,
+    reuse_ai: bool,
+    last_save: f64,
+    saved: [String; 3],
 }
 
 fn main() -> eframe::Result {
@@ -217,6 +276,10 @@ impl App {
             shot: None,
             mode: if std::env::var_os("VE_MONTAGE").is_some() { Mode::Montage } else { Mode::Single },
             mon: montage_ui::State::new(),
+            video_fp: None,
+            reuse_ai: true,
+            last_save: 0.0,
+            saved: Default::default(),
         };
         app.use_sample();
         app.status = if app.tools.is_some() {
@@ -227,7 +290,96 @@ impl App {
         if let (Some(path), Ok(n)) = (std::env::var_os("VE_SCREENSHOT"), std::env::var("VE_SCREENSHOT_FRAMES")) {
             app.shot = Some((path.into(), n.parse().unwrap_or(12)));
         }
+        app.restore();
         app
+    }
+
+    // ------------------------------------------------------------------ memory
+
+    fn settings(&self) -> Settings {
+        Settings {
+            last_video: self.source.as_ref().map(|s| s.path.clone()),
+            montage: self.mode == Mode::Montage,
+            openai_model: self.openai_model,
+            style_notes: self.style_notes.clone(),
+            reuse_ai: self.reuse_ai,
+            wants_wide: self.wants_wide,
+            wide_height: self.wide_height,
+            wants_vertical: self.wants_vertical,
+            wants_lut: self.wants_lut,
+            wants_thumb: self.wants_thumb,
+            out_dir: self.out_dir.clone(),
+        }
+    }
+
+    fn video_session(&self) -> Option<VideoSession> {
+        self.source.as_ref()?;
+        Some(VideoSession {
+            grade: self.grade,
+            auto_base: self.auto_base,
+            learned: self.learned.clone(),
+            look: self.look,
+            finish: self.finish,
+            trim: self.trim,
+            t: self.t,
+            ai_result: self.ai_result.clone(),
+            framing: self.framing,
+            manual_x: self.manual_x,
+            action: self.action.clone(),
+        })
+    }
+
+    /// Brings back the last session: settings, the last video, and the montage in progress.
+    fn restore(&mut self) {
+        if let Some(s) = store::load::<Settings>("settings") {
+            self.openai_model = s.openai_model.min(ai::OPENAI_MODELS.len() - 1);
+            self.style_notes = s.style_notes;
+            self.reuse_ai = s.reuse_ai;
+            self.wants_wide = s.wants_wide;
+            self.wide_height = s.wide_height;
+            self.wants_vertical = s.wants_vertical;
+            self.wants_lut = s.wants_lut;
+            self.wants_thumb = s.wants_thumb;
+            self.out_dir = s.out_dir.filter(|d| d.is_dir());
+            if std::env::var_os("VE_MONTAGE").is_none() && s.montage {
+                self.mode = Mode::Montage;
+            }
+            if let Some(path) = s.last_video.filter(|p| p.is_file()) {
+                self.open(path);
+            }
+        }
+        self.restore_montage();
+    }
+
+    /// Writes anything that changed, at most once a second.
+    fn autosave(&mut self, now: f64) {
+        if now - self.last_save < 1.0 {
+            return;
+        }
+        self.last_save = now;
+        if let (Some(fp), Some(session)) = (&self.video_fp, self.video_session()) {
+            let text = serde_json::to_string(&session).unwrap_or_default();
+            if text != self.saved[0] {
+                store::save(&format!("video-{fp}"), &session);
+                self.saved[0] = text;
+            }
+        }
+        let mut settings = self.settings();
+        // Keep the last video when the sample picture is showing, so it still reopens next time.
+        if settings.last_video.is_none() && self.video_fp.is_none() {
+            settings.last_video = store::load::<Settings>("settings").and_then(|s| s.last_video);
+        }
+        let text = serde_json::to_string(&settings).unwrap_or_default();
+        if text != self.saved[1] {
+            store::save("settings", &settings);
+            self.saved[1] = text;
+        }
+        if let Some(text) = self.mon.autosave_text()
+            && text != self.saved[2]
+        {
+            self.mon.save();
+            self.saved[2] = text;
+        }
     }
 
     fn note(&mut self, text: impl Into<String>) {
@@ -333,7 +485,13 @@ impl App {
         self.ai_busy = Some("Gemini Omni is grading a sample…".into());
         let (probe, path, mail, (a, b)) = (source.probe.clone(), source.path.clone(), self.mail.clone(), self.trim);
         let prompt = ai::omni_prompt(self.style_notes.trim());
+        // The same video, range and wording always gives the same question, so its answer can be reused.
+        let cache = format!("ai-omni-{}", store::hash(&["omni".into(), store::fingerprint(&path), format!("{a:.2}-{b:.2}"), prompt.clone()]));
+        let reuse = self.reuse_ai;
         std::thread::spawn(move || {
+            if reuse && let Some(look) = store::load::<LearnedLook>(&cache) {
+                return mail.send(Msg::Omni(Ok(look), true));
+            }
             let work = std::env::temp_dir().join(format!("video-enhancer-omni-{}", std::process::id()));
             let result = (|| {
                 std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
@@ -348,7 +506,10 @@ impl App {
                 ai::learn_from_omni(&tools, &sample, &graded)
             })();
             std::fs::remove_dir_all(&work).ok();
-            mail.send(Msg::Omni(result));
+            if let Ok(look) = &result {
+                store::save(&cache, look);
+            }
+            mail.send(Msg::Omni(result, false));
         });
     }
 
@@ -361,7 +522,12 @@ impl App {
         let tools = self.tools.clone();
         let (a, b) = self.trim;
         let sample = self.raw.clone();
+        let cache = source.as_ref().map(|(_, path)| format!("ai-suggest-{}", store::hash(&["suggest".into(), model.into(), goal.clone(), store::fingerprint(path), format!("{a:.2}-{b:.2}")])));
+        let reuse = self.reuse_ai;
         std::thread::spawn(move || {
+            if reuse && let Some(saved) = cache.as_ref().and_then(|c| store::load::<ai::Suggestion>(c)) {
+                return mail.send(Msg::Suggestion(Ok(saved), true));
+            }
             let result = (|| {
                 let mut frames = Vec::new();
                 if let (Some(tools), Some((probe, path))) = (&tools, &source) {
@@ -374,7 +540,10 @@ impl App {
                 }
                 ai::openai_suggest(&key, model, &frames, &goal)
             })();
-            mail.send(Msg::Suggestion(result));
+            if let (Ok(found), Some(cache)) = (&result, &cache) {
+                store::save(cache, found);
+            }
+            mail.send(Msg::Suggestion(result, false));
         });
     }
 
@@ -474,17 +643,36 @@ impl App {
                 if !probe.is_wide() {
                     warnings.push("this isn't 16:9, so the wide version will be cropped");
                 }
-                self.t = probe.duration * 0.1;
-                self.trim = (0.0, probe.duration);
-                self.action = None;
-                self.learned = None;
-                self.look = Some(0);
-                self.ai_result.clear();
+                let fp = store::fingerprint(&path);
+                let saved: Option<VideoSession> = store::load(&format!("video-{fp}"));
+                let restored = saved.is_some();
+                self.video_fp = Some(fp);
+                match saved {
+                    Some(s) => {
+                        let ok = s.trim.0 >= 0.0 && s.trim.1 <= probe.duration + 0.5 && s.trim.1 - s.trim.0 >= 0.2;
+                        self.trim = if ok { s.trim } else { (0.0, probe.duration) };
+                        self.t = s.t.clamp(0.0, probe.duration);
+                        (self.grade, self.auto_base, self.learned, self.look) = (s.grade, s.auto_base, s.learned, s.look);
+                        (self.finish, self.ai_result, self.framing, self.manual_x, self.action) = (s.finish, s.ai_result, s.framing, s.manual_x, s.action);
+                    }
+                    None => {
+                        self.t = probe.duration * 0.1;
+                        self.trim = (0.0, probe.duration);
+                        self.action = None;
+                        self.learned = None;
+                        self.look = Some(0);
+                        self.ai_result.clear();
+                    }
+                }
                 let message = format!("{}  {}x{}  {}  {:.0} fps", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()), probe.width, probe.height, clock(probe.duration), probe.fps);
                 self.source = Some(Source { path, probe });
                 let t = self.t;
                 self.request_frame(t);
-                self.analyse();
+                if restored {
+                    warnings.insert(0, "restored your earlier grade and AI results");
+                } else {
+                    self.analyse();
+                }
                 self.note(if warnings.is_empty() { message } else { format!("{message}  ({})", warnings.join("; ")) });
             }
             Msg::Frame(result) => {
@@ -517,7 +705,7 @@ impl App {
                 }
             }
             Msg::Note(text) => self.note(text),
-            Msg::Omni(result) => {
+            Msg::Omni(result, reused) => {
                 self.ai_busy = None;
                 match result {
                     Ok(look) => {
@@ -525,12 +713,12 @@ impl App {
                         self.grade = Grade::default();
                         self.look = None;
                         self.ai_result = "Gemini Omni's colour look is applied to your whole video. Use the slider to blend it.".into();
-                        self.note("Done. Omni's look was copied onto your real footage.");
+                        self.note(if reused { "Reused your saved Omni result. Nothing was sent and nothing was charged." } else { "Done. Omni's look was copied onto your real footage. It is saved, so it will still be here next time." });
                     }
                     Err(e) => self.fail(e),
                 }
             }
-            Msg::Suggestion(result) => {
+            Msg::Suggestion(result, reused) => {
                 self.ai_busy = None;
                 match result {
                     Ok(s) => {
@@ -538,7 +726,7 @@ impl App {
                         self.learned = None;
                         self.look = None;
                         self.ai_result = format!("{}: {}", s.look, s.reasoning);
-                        self.note("Done. The suggested grade is applied. Adjust anything you like.");
+                        self.note(if reused { "Reused your saved suggestion. Nothing was sent and no tokens were used." } else { "Done. The suggested grade is applied and saved. Adjust anything you like." });
                     }
                     Err(e) => self.fail(e),
                 }
@@ -797,6 +985,13 @@ impl App {
         ui.label(RichText::new("Optional. They need your own API key.").weak().small());
         ui.label("Style you want");
         ui.add(egui::TextEdit::multiline(&mut self.style_notes).desired_rows(2).desired_width(f32::INFINITY));
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.reuse_ai, "Reuse saved AI answers").on_hover_text("When nothing has changed, a saved answer is shown instead of asking the AI again. No cost, no tokens.");
+            if ui.small_button("Forget saved answers").clicked() {
+                let n = store::clear_ai_cache();
+                self.note(format!("Forgot {n} saved AI answer(s). The next request will ask the AI again."));
+            }
+        });
         let busy = self.ai_busy.is_some();
         let have_video = self.source.is_some();
         ui.add_enabled_ui(!busy, |ui| {
@@ -1021,6 +1216,7 @@ impl eframe::App for App {
             self.toggle_play();
         }
         self.refresh(&ctx);
+        self.autosave(ctx.input(|i| i.time));
 
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1045,6 +1241,7 @@ impl eframe::App for App {
                     }
                     if self.source.is_some() && ui.button("Use sample picture").clicked() {
                         self.source = None;
+                        self.video_fp = None;
                         self.player = None;
                         self.use_sample();
                     }

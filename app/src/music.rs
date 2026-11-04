@@ -16,7 +16,7 @@ use crate::media::{self, Tools};
 
 const USER_AGENT: &str = "VideoEnhancer/0.1 (desktop app)";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub title: String,
     pub creator: String,

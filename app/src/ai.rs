@@ -169,7 +169,7 @@ pub fn learn_from_omni(tools: &Tools, original: &Path, graded: &Path) -> Result<
 
 // --------------------------------------------------------------------- OpenAI
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Suggestion {
     pub look: String,
     pub reasoning: String,
@@ -300,6 +300,7 @@ pub struct ClipBrief {
     pub peaks: Vec<f64>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AiPlan {
     pub title: String,
     pub music_query: String,

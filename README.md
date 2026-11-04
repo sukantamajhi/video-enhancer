@@ -41,6 +41,17 @@ Notes:
 - The story title needs a system font (Arial on Windows); without one the title is skipped.
 - Pasting a YouTube link to rip music is deliberately not supported: it breaks YouTube's terms and can't make a track safe to use.
 
+## Your work is remembered (so AI results are never paid for twice)
+
+The app saves as you go to `%LOCALAPPDATA%\VideoEnhancer\saved`:
+
+- **Per video**: the grade, the look, a Gemini Omni look, an OpenAI suggestion, the export range and the 9:16 framing. Reopen the same file (even after a restart) and it all comes back. The app also reopens your last video on start.
+- **The montage in progress**: clips, choices, the AI's cut list (including moments you unticked), the song list and your pick. It is restored when you start the app, and **Make montage** works at once.
+- **A cache of AI answers**, keyed by exactly what was asked (the footage, range, style, length, model and your wording). Ask the same thing again and the saved answer is used: nothing is sent, no tokens or money are spent, and the status bar says so. Change anything, or edit the video file, and a new question is asked.
+- **Reuse saved AI answers** (tick box) turns the cache off when you want fresh ideas; **Forget saved answers** clears it.
+
+API keys are not in this folder; they stay in the system credential store. Saved files are plain JSON and safe to delete.
+
 ## Tests
 
 `cargo test` runs the colour, AI-reply and parsing tests. If FFmpeg is installed it also runs the end-to-end tests that export a **2-minute** video in every shape and build montages in every style, sound mode and shape; without FFmpeg those tests skip themselves.

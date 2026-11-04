@@ -27,7 +27,7 @@ impl Clip {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Style {
     Highlights,
     BeatSync,
@@ -71,7 +71,7 @@ impl Style {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Sound {
     MusicAndOriginal,
     OriginalOnly,
@@ -94,7 +94,7 @@ impl Sound {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Vertical {
     Follow,
     Centre,
@@ -108,7 +108,7 @@ pub enum Out {
 }
 
 /// One moment taken from one clip.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Cut {
     pub clip: usize,
     pub start: f64,

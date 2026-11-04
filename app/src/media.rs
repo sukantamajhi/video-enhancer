@@ -205,7 +205,7 @@ pub fn probe(tools: &Tools, path: &Path) -> Result<Probe, String> {
 }
 
 /// Sharpening, noise cleanup and sound levelling, shared by preview and export.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Finish {
     pub sharpen: f32,
     pub denoise: f32,

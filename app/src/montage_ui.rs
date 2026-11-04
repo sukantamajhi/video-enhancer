@@ -6,17 +6,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Color32, RichText, vec2};
+use serde::{Deserialize, Serialize};
 
 use crate::grade::{Grade, LOOKS, LUT_SIZE, Lut};
 use crate::media::{self, Probe};
 use crate::montage::{self, Clip, Cut, Job, Music, Out, Sound, Style, Vertical};
 use crate::music::{self, Track};
-use crate::{App, Msg, ai};
+use crate::{App, Msg, ai, store};
 
 const MAX_CLIPS: usize = 12;
 
 pub enum Event {
     Probed(PathBuf, Result<Probe, String>),
+    /// The clips of the last session, probed again. The number is how many were saved.
+    Restored(Vec<Clip>, usize),
     Note(String),
     Plan(Result<PlanData, String>),
     Tracks(Result<Vec<Track>, String>),
@@ -24,15 +27,41 @@ pub enum Event {
     Done(Result<Vec<PathBuf>, String>),
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PlanData {
     pub cuts: Vec<Cut>,
     pub grades: Vec<Grade>,
     pub title: String,
     pub music_query: String,
     pub tempo: String,
+    /// True when a saved AI answer was reused instead of asking again. Not saved.
+    #[serde(skip)]
+    pub reused: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// The montage in progress, remembered between runs (AI plan and music included).
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    clips: Vec<PathBuf>,
+    style: Style,
+    sound: Sound,
+    vertical: Vertical,
+    target: f64,
+    look: Option<usize>,
+    source: MusicSource,
+    file: Option<PathBuf>,
+    tracks: Vec<Track>,
+    track: usize,
+    music_query: String,
+    plan: Option<PlanData>,
+    keep: Vec<bool>,
+    title: String,
+    make_wide: bool,
+    make_vertical: bool,
+    out_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum MusicSource {
     Online,
     File,
@@ -91,6 +120,37 @@ impl State {
         }
     }
 
+    fn session(&self) -> Saved {
+        Saved {
+            clips: self.clips.iter().map(|c| c.path.clone()).collect(),
+            style: self.style,
+            sound: self.sound,
+            vertical: self.vertical,
+            target: self.target,
+            look: self.look,
+            source: self.source,
+            file: self.file.clone(),
+            tracks: self.tracks.clone(),
+            track: self.track,
+            music_query: self.music_query.clone(),
+            plan: self.plan.clone(),
+            keep: self.keep.clone(),
+            title: self.title.clone(),
+            make_wide: self.make_wide,
+            make_vertical: self.make_vertical,
+            out_dir: self.out_dir.clone(),
+        }
+    }
+
+    /// A snapshot of what would be saved, or nothing while a restore is still loading the clips.
+    pub fn autosave_text(&self) -> Option<String> {
+        (self.probing == 0).then(|| serde_json::to_string(&self.session()).unwrap_or_default())
+    }
+
+    pub fn save(&self) {
+        store::save("montage", &self.session());
+    }
+
     /// True while something is running that needs the window to keep refreshing.
     pub fn working(&self) -> bool {
         self.busy.is_some() || self.render.is_some() || self.searching || self.probing > 0
@@ -145,6 +205,19 @@ impl App {
 
     pub fn montage_event(&mut self, event: Event) {
         match event {
+            Event::Restored(clips, saved) => {
+                self.mon.probing = self.mon.probing.saturating_sub(1);
+                if clips.len() == saved {
+                    self.mon.clips = clips;
+                    self.note(if self.mon.plan.is_some() { "Restored your last montage, including the AI's plan. Nothing needs to be asked again." } else { "Restored your clips from last time." });
+                } else {
+                    // Some files moved or were deleted, so the saved cut list no longer lines up.
+                    self.mon.clips = clips;
+                    self.mon.plan = None;
+                    self.mon.keep.clear();
+                    self.note("Some clips from your last session are gone, so the AI plan was cleared. Plan again when you're ready.");
+                }
+            }
             Event::Probed(path, result) => {
                 self.mon.probing = self.mon.probing.saturating_sub(1);
                 match result {
@@ -164,7 +237,8 @@ impl App {
                 self.mon.title = plan.title.clone();
                 self.mon.music_query = plan.music_query.clone();
                 let total: f64 = plan.cuts.iter().map(Cut::len).sum();
-                self.note(format!("The AI chose {} moments ({} before fades). Untick any you don't want, then make the montage.", plan.cuts.len(), clock(total)));
+                let reused = if plan.reused { " Reused your saved AI answer, so no tokens were used." } else { "" };
+                self.note(format!("The AI chose {} moments ({} before fades). Untick any you don't want, then make the montage.{reused}", plan.cuts.len(), clock(total)));
                 self.mon.plan = Some(plan);
             }
             Event::Plan(Err(e)) => {
@@ -203,6 +277,31 @@ impl App {
         }
     }
 
+    /// Brings back the montage from the last run: choices, AI plan, songs and clips.
+    pub fn restore_montage(&mut self) {
+        let (Some(saved), Some(tools)) = (store::load::<Saved>("montage"), self.tools.clone()) else { return };
+        let m = &mut self.mon;
+        (m.style, m.sound, m.vertical, m.target, m.look, m.source) = (saved.style, saved.sound, saved.vertical, saved.target.clamp(10.0, 900.0), saved.look.filter(|i| *i < LOOKS.len()), saved.source);
+        (m.file, m.tracks, m.music_query, m.title) = (saved.file, saved.tracks, saved.music_query, saved.title);
+        m.track = saved.track.min(m.tracks.len().saturating_sub(1));
+        (m.make_wide, m.make_vertical, m.out_dir) = (saved.make_wide, saved.make_vertical, saved.out_dir.filter(|d| d.is_dir()));
+        m.keep = saved.keep;
+        m.plan = saved.plan.filter(|p| p.cuts.len() == m.keep.len() && p.grades.len() == saved.clips.len());
+        if m.plan.is_none() {
+            m.keep.clear();
+        }
+        if saved.clips.is_empty() {
+            return;
+        }
+        m.probing += 1;
+        let (mail, expected) = (self.mail.clone(), saved.clips.len());
+        std::thread::spawn(move || {
+            // Keep the original order, and drop any file that is no longer there.
+            let clips: Vec<Clip> = saved.clips.into_iter().filter_map(|path| media::probe(&tools, &path).ok().map(|probe| Clip { path, probe })).collect();
+            mail.send(Msg::Montage(Event::Restored(clips, expected)));
+        });
+    }
+
     fn search_music(&mut self) {
         if self.mon.searching {
             return;
@@ -230,6 +329,7 @@ impl App {
         let (clips, style, target, look, notes) = (m.clips.clone(), m.style, m.target, m.look, self.style_notes.clone());
         let wants_music = m.sound.uses_music() && m.source == MusicSource::Online;
         let model = ai::OPENAI_MODELS[self.openai_model].0;
+        let reuse = self.reuse_ai;
         self.mon.busy = Some("Planning the montage…".into());
         self.mon.plan = None;
         self.mon.tracks.clear();
@@ -248,14 +348,25 @@ impl App {
                     briefs.push(ai::ClipBrief { name: clip.name(), duration: clip.probe.duration, peaks: energy.peaks(5), frames });
                     energies.push(energy);
                 }
-                note(format!("Asking {model} to choose the best moments…"));
-                let plan = ai::openai_plan(&key, model, &briefs, style, target, &notes)?;
+                // The same clips, style, length, model and wording always make the same question.
+                let mut facts = vec!["plan".to_string(), model.to_string(), style.name().to_string(), format!("{target:.0}"), notes.trim().to_string(), format!("{look:?}")];
+                facts.extend(clips.iter().map(|c| format!("{}|{:.2}", store::fingerprint(&c.path), c.probe.duration)));
+                let cache = format!("ai-plan-{}", store::hash(&facts));
+                let (plan, reused) = match reuse.then(|| store::load::<ai::AiPlan>(&cache)).flatten() {
+                    Some(saved) => (saved, true),
+                    None => {
+                        note(format!("Asking {model} to choose the best moments…"));
+                        let fresh = ai::openai_plan(&key, model, &briefs, style, target, &notes)?;
+                        store::save(&cache, &fresh);
+                        (fresh, false)
+                    }
+                };
                 let durations: Vec<f64> = clips.iter().map(|c| c.probe.duration).collect();
                 let cuts = montage::plan_cuts(plan.cuts, &durations, &energies, style, target);
                 if cuts.is_empty() {
                     return Err("The AI's suggestions didn't fit your clips. Try again.".into());
                 }
-                Ok(PlanData { cuts, grades, title: plan.title, music_query: plan.music_query, tempo: plan.tempo })
+                Ok(PlanData { cuts, grades, title: plan.title, music_query: plan.music_query, tempo: plan.tempo, reused })
             })();
             let query = result.as_ref().ok().map(|p| p.music_query.clone());
             mail.send(Msg::Montage(Event::Plan(result)));
@@ -563,6 +674,13 @@ impl App {
                 ui.label(text);
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.reuse_ai, "Reuse saved AI answers").on_hover_text("When the clips and choices are unchanged, the saved plan is used instead of asking the AI again. No tokens spent. Untick for fresh ideas.");
+            if ui.small_button("Forget saved answers").clicked() {
+                let n = store::clear_ai_cache();
+                self.note(format!("Forgot {n} saved AI answer(s). The next plan will ask the AI again."));
+            }
+        });
         if !self.has_openai {
             ui.horizontal(|ui| {
                 ui.label("OpenAI key");
@@ -646,4 +764,43 @@ impl App {
 
 fn media_progress(mail: &crate::Mailbox, done: f32, steps: f32, label: &str) {
     mail.send(Msg::Montage(Event::Progress((done / steps).clamp(0.0, 1.0), format!("Making the {label} montage…"))));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_montage_in_progress_survives_a_restart() {
+        let mut state = State::new();
+        state.style = Style::BeatSync;
+        state.target = 90.0;
+        state.title = "Road Trip".into();
+        state.keep = vec![true, false];
+        state.tracks = vec![Track {
+            title: "Song".into(),
+            creator: "Ann".into(),
+            url: "https://example.org/s.mp3".into(),
+            landing: "https://example.org/s".into(),
+            license: "by".into(),
+            license_url: "https://creativecommons.org/licenses/by/4.0/".into(),
+            attribution: String::new(),
+            seconds: 120.0,
+            source: "x".into(),
+            instrumental: true,
+        }];
+        let cut = |start: f64| Cut { clip: 0, start, end: start + 3.0, score: 0.8, why: "sunset".into() };
+        state.plan = Some(PlanData { cuts: vec![cut(1.0), cut(9.0)], grades: vec![Grade::default()], title: "Road Trip".into(), music_query: "upbeat".into(), tempo: "fast".into(), reused: true });
+
+        let text = state.autosave_text().unwrap();
+        let back: Saved = serde_json::from_str(&text).unwrap();
+        let plan = back.plan.expect("the AI plan must be saved");
+        assert_eq!((back.style, back.target, back.keep.clone()), (Style::BeatSync, 90.0, vec![true, false]));
+        assert_eq!((plan.cuts.len(), plan.cuts[1].start, plan.cuts[1].why.as_str(), plan.music_query.as_str()), (2, 9.0, "sunset", "upbeat"));
+        assert!(!plan.reused, "the reused marker belongs to one run only");
+        assert_eq!(back.tracks[0].title, "Song");
+        // While clips are still loading after a restart nothing is saved, so a half-restored state can't overwrite a good one.
+        state.probing = 1;
+        assert!(state.autosave_text().is_none());
+    }
 }

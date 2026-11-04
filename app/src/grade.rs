@@ -5,8 +5,10 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// Everything the sliders control. All neutral values leave the picture untouched.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Grade {
     pub black: [f32; 3],
     pub white: [f32; 3],
@@ -83,7 +85,7 @@ impl Look {
 }
 
 /// A look learned by comparing a clip with Gemini Omni's graded version of it.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LearnedLook {
     pub curves: [Vec<f32>; 3],
     pub saturation: f32,
