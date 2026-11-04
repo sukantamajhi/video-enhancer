@@ -1,0 +1,39 @@
+# Rust build output (~3.5 GB)
+target/
+
+# Logs
+*.log
+
+# Generated run/session state
+usage.json
+feed.json
+
+# Environment / secrets (API keys, e.g. Gemini)
+.env
+.env.*
+!.env.example
+
+# Video / media artifacts (inputs and enhanced outputs)
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4v
+output/
+outputs/
+tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code local settings
+.claude/settings.local.json

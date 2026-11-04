@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "name": "Create a video editor using",
+  "request": "Create a video editor using gemini omni 1.1 model which will take input of the video and it will just enhance the video like color best tuning for youtube videos then it will take input of the 16:9 ratio and generate both 16:9 and 9:16 of that color graded video and much more. Tell me some more suggestion what more can we do here.",
+  "target": {
+    "kind": "none"
+  },
+  "stack": "Rust + egui (eframe)",
+  "status": "stopped",
+  "note": "Paused. Send a message to continue.",
+  "created_ms": 1793824824757,
+  "updated_ms": 1793825976967,
+  "checks": [],
+  "agent_session": "3d7497dc-4b75-4528-84db-488e5cd4fdb1",
+  "allowed_actions": [],
+  "last_reply": "",
+  "asset_budget_usd": 5.0,
+  "generate_assets": false
+}

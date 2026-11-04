@@ -1,0 +1,14 @@
+{
+  "id": "unk_762b06a07b91bf65",
+  "revision": 1,
+  "question": "Does a live Gemini Omni 1.1 call accept an inline 10-second video and return a colour-graded clip in the documented reply shape?",
+  "severity": "high",
+  "domain": "gemini",
+  "status": "open",
+  "probes": [
+    "Run the app's Omni button with a paid Gemini API key and a short clip",
+    "Compare the reply against the documented steps/model_output/video shape"
+  ],
+  "evidence_for": [],
+  "evidence_against": []
+}

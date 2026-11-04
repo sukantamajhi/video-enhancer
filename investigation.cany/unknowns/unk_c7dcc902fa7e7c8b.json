@@ -1,0 +1,13 @@
+{
+  "id": "unk_c7dcc902fa7e7c8b",
+  "revision": 1,
+  "question": "Does Omni keep the source footage's framing and subjects when asked only to change colour, or does it redraw them noticeably?",
+  "severity": "medium",
+  "domain": "gemini",
+  "status": "open",
+  "probes": [
+    "Send a real clip with a colour-only prompt and compare the returned frames with the originals"
+  ],
+  "evidence_for": [],
+  "evidence_against": []
+}
