@@ -9,7 +9,7 @@ use eframe::egui::{self, Frame, Margin, RichText, Sense, Stroke, vec2};
 use crate::grade::Grade;
 use crate::media::{self, Finish, GrabOptions};
 use crate::montage::{self, Cut, Style};
-use crate::pack::{self, Candidate, Level, Pack, PackFormat, Segment};
+use crate::pack::{self, Candidate, Level, Pack, PackFormat, Segment, ThumbShape};
 use crate::theme::{self, Kind};
 use crate::{App, Msg, Step, ai, store};
 
@@ -20,9 +20,9 @@ pub enum Target {
 }
 
 pub enum Event {
-    /// The pack, its thumbnail picture, and whether a saved answer was reused.
-    Made(Target, Result<(Pack, Vec<u8>, bool), String>),
-    Thumb(Target, Result<Vec<u8>, String>),
+    /// The pack, its wide and tall thumbnail pictures, and whether a saved answer was reused.
+    Made(Target, Result<(Pack, Vec<u8>, Vec<u8>, bool), String>),
+    Thumb(Target, ThumbShape, Result<Vec<u8>, String>),
 }
 
 /// What the montage screen can say about the finished video, for chapters and thumbnails.
@@ -47,6 +47,14 @@ pub struct PackState {
     pub thumb_busy: bool,
     pub thumb_error: Option<String>,
     pub auto_tried: bool,
+    /// The 9:16 thumbnail for a Short, with its own picture and texture.
+    pub thumb_tall: Option<Vec<u8>>,
+    pub tex_tall: Option<egui::TextureHandle>,
+    pub tall_busy: bool,
+    /// Which of the two the preview shows.
+    pub view_tall: bool,
+    /// The crop slider moved and the picture hasn't been redrawn yet.
+    pub tall_dirty: bool,
 }
 
 impl PackState {
@@ -55,7 +63,7 @@ impl PackState {
     }
 
     pub fn working(&self) -> bool {
-        self.busy.is_some() || self.thumb_busy
+        self.busy.is_some() || self.thumb_busy || self.tall_busy
     }
 }
 
@@ -71,6 +79,7 @@ struct Request {
 enum Action {
     Write,
     Redraw,
+    RedrawTall,
     Save,
 }
 
@@ -84,21 +93,24 @@ impl App {
 
     pub fn pack_event(&mut self, event: Event) {
         match event {
-            Event::Made(target, Ok((pack, jpeg, reused))) => {
+            Event::Made(target, Ok((pack, jpeg, tall, reused))) => {
                 let st = self.pack_state(target);
+                st.view_tall = pack.format == PackFormat::Short;
                 (st.busy, st.pack, st.thumb, st.tex, st.thumb_error, st.auto_tried) = (None, Some(pack), Some(jpeg), None, None, true);
+                (st.thumb_tall, st.tex_tall, st.tall_busy) = (Some(tall), None, false);
                 self.note(if reused { "Upload pack ready. Reused your saved AI answer, so no tokens were used." } else { "Upload pack ready. Edit anything, then save it." });
             }
             Event::Made(target, Err(e)) => {
                 self.pack_state(target).busy = None;
                 self.fail(e);
             }
-            Event::Thumb(target, result) => {
+            Event::Thumb(target, shape, result) => {
                 let st = self.pack_state(target);
-                st.thumb_busy = false;
-                match result {
-                    Ok(bytes) => (st.thumb, st.tex, st.thumb_error) = (Some(bytes), None, None),
-                    Err(e) => st.thumb_error = Some(e),
+                match (shape, result) {
+                    (ThumbShape::Wide, Ok(bytes)) => (st.thumb_busy, st.thumb, st.tex, st.thumb_error) = (false, Some(bytes), None, None),
+                    (ThumbShape::Tall, Ok(bytes)) => (st.tall_busy, st.thumb_tall, st.tex_tall, st.thumb_error) = (false, Some(bytes), None, None),
+                    (ThumbShape::Wide, Err(e)) => (st.thumb_busy, st.thumb_error) = (false, Some(e)),
+                    (ThumbShape::Tall, Err(e)) => (st.tall_busy, st.thumb_error) = (false, Some(e)),
                 }
             }
         }
@@ -162,7 +174,7 @@ impl App {
         self.pack_state(target).busy = Some("Writing your upload pack…".into());
         std::thread::spawn(move || {
             let work = std::env::temp_dir().join(format!("video-enhancer-pack-{}-{target:?}", std::process::id()));
-            let result = (|| -> Result<(Pack, Vec<u8>, bool), String> {
+            let result = (|| -> Result<(Pack, Vec<u8>, Vec<u8>, bool), String> {
                 let options = GrabOptions { width: 512, finish: Finish { sharpen: 0.0, denoise: 0.0, loudness: false }, crop_wide: false };
                 let mut frames = Vec::new();
                 for c in &request.candidates {
@@ -183,27 +195,41 @@ impl App {
                     }
                 };
                 let pack = Pack::assemble(&answer, &request.segments, request.candidates.clone(), request.credit.clone(), format)?;
-                let jpeg = pack::render_thumbnail(&tools, &pack.candidates[pack.thumb_pick], &pack.thumb_text, &work)?;
-                Ok((pack, jpeg, reused))
+                let picked = &pack.candidates[pack.thumb_pick];
+                let jpeg = pack::render_thumbnail(&tools, picked, &pack.thumb_text, &work, ThumbShape::Wide, 0.5)?;
+                let tall = pack::render_thumbnail(&tools, picked, &pack.thumb_text, &work, ThumbShape::Tall, 0.5)?;
+                Ok((pack, jpeg, tall, reused))
             })();
             std::fs::remove_dir_all(&work).ok();
             mail.send(Msg::Pack(Event::Made(target, result)));
         });
     }
 
-    fn redraw_thumbnail(&mut self, target: Target) {
+    /// Draws the thumbnails again: both shapes, or just the one that changed.
+    fn redraw_thumbnail(&mut self, target: Target, only: Option<ThumbShape>) {
         let Some(tools) = self.tools.clone() else { return };
         let st = self.pack_state(target);
         let Some(pack) = &st.pack else { return };
-        let (candidate, text) = (pack.candidates.get(pack.thumb_pick).cloned(), pack.thumb_text.clone());
+        let (candidate, text, x) = (pack.candidates.get(pack.thumb_pick).cloned(), pack.thumb_text.clone(), pack.thumb_x.unwrap_or(0.5));
         let Some(candidate) = candidate else { return };
-        st.thumb_busy = true;
+        let shapes: Vec<ThumbShape> = match only {
+            Some(s) => vec![s],
+            None => vec![ThumbShape::Wide, ThumbShape::Tall],
+        };
+        for shape in &shapes {
+            match shape {
+                ThumbShape::Wide => st.thumb_busy = true,
+                ThumbShape::Tall => st.tall_busy = true,
+            }
+        }
         let mail = self.mail.clone();
         std::thread::spawn(move || {
             let work = std::env::temp_dir().join(format!("video-enhancer-thumb-{}-{target:?}", std::process::id()));
-            let result = pack::render_thumbnail(&tools, &candidate, &text, &work);
+            for shape in shapes {
+                let result = pack::render_thumbnail(&tools, &candidate, &text, &work, shape, x);
+                mail.send(Msg::Pack(Event::Thumb(target, shape, result)));
+            }
             std::fs::remove_dir_all(&work).ok();
-            mail.send(Msg::Pack(Event::Thumb(target, result)));
         });
     }
 
@@ -221,7 +247,7 @@ impl App {
         };
         let dir = dir.unwrap_or_else(std::env::temp_dir);
         let st = self.pack_state(target);
-        let (Some(pack), thumb) = (&st.pack, st.thumb.clone()) else { return };
+        let (Some(pack), thumb, tall) = (&st.pack, st.thumb.clone(), st.thumb_tall.clone()) else { return };
         let text_file = media::free_name(&dir, &stem, "_upload_pack", "txt");
         let mut saved = vec![text_file.clone()];
         let mut problem = std::fs::write(&text_file, pack.as_text()).err().map(|e| e.to_string());
@@ -229,6 +255,11 @@ impl App {
             let thumb_file = media::free_name(&dir, &stem, "_thumbnail", "jpg");
             problem = std::fs::write(&thumb_file, bytes).err().map(|e| e.to_string());
             saved.push(thumb_file);
+        }
+        if let (None, Some(bytes)) = (&problem, tall) {
+            let tall_file = media::free_name(&dir, &stem, "_thumbnail_shorts", "jpg");
+            problem = std::fs::write(&tall_file, bytes).err().map(|e| e.to_string());
+            saved.push(tall_file);
         }
         match problem {
             None => self.note(format!("Saved {} to {}", saved.iter().filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned())).collect::<Vec<_>>().join(" and "), dir.display())),
@@ -260,9 +291,18 @@ impl App {
                 let rgba = picture.to_rgba8();
                 st.tex = Some(ctx.load_texture(format!("pack-thumb-{target:?}"), egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba), egui::TextureOptions::LINEAR));
             }
-            // A pack restored from last time has its words but not its picture yet.
-            if st.pack.is_some() && st.thumb.is_none() && !st.thumb_busy && !st.auto_tried {
+            if st.tex_tall.is_none()
+                && let Some(bytes) = &st.thumb_tall
+                && let Ok(picture) = image::load_from_memory(bytes)
+            {
+                let rgba = picture.to_rgba8();
+                st.tex_tall = Some(ctx.load_texture(format!("pack-thumb-tall-{target:?}"), egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba), egui::TextureOptions::LINEAR));
+            }
+            // A pack restored from last time has its words but not its pictures yet.
+            if st.pack.is_some() && (st.thumb.is_none() || st.thumb_tall.is_none()) && !st.thumb_busy && !st.tall_busy && !st.auto_tried {
                 st.auto_tried = true;
+                // A pack for a Short opens on the tall thumbnail.
+                st.view_tall = st.pack.as_ref().is_some_and(|p| p.format == PackFormat::Short);
                 action = Some(Action::Redraw);
             }
             (st.busy.clone(), st.pack.is_some())
@@ -272,14 +312,18 @@ impl App {
         if have {
             egui::Panel::right("publish-side").exact_size(440.0).frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(20, 0))).show(ui, |ui| {
                 egui::Panel::bottom("publish-footer").exact_size(84.0).frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(0, 16))).show_separator_line(true).show(ui, |ui| {
-                    if theme::button(ui, "Save pack and thumbnail", Kind::Primary, ui.available_width()).clicked() {
+                    if theme::button(ui, "Save pack and thumbnails", Kind::Primary, ui.available_width()).clicked() {
                         action = Some(Action::Save);
                     }
                 });
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.add_space(16.0);
                     let st = self.pack_state(target);
-                    let (thumb_busy, tex, thumb_error) = (st.thumb_busy, st.tex.clone(), st.thumb_error.clone());
+                    let (thumb_busy, tex, thumb_error) = (st.thumb_busy || st.tall_busy, st.tex.clone(), st.thumb_error.clone());
+                    let (tex_tall, mut view_tall) = (st.tex_tall.clone(), st.view_tall);
+                    let mut dirty = st.tall_dirty;
+                    let released = !ui.input(|i| i.pointer.any_down());
+                    let mut changed_x = false;
                     let Some(pack) = &mut st.pack else { return };
                     let checks = pack.seo_checks();
                     let good = checks.iter().filter(|c| c.level == Level::Good).count();
@@ -303,14 +347,39 @@ impl App {
                         }
                     });
                     theme::card(ui, |ui| {
-                        ui.label(theme::bold("Thumbnail", 15.0));
+                        ui.horizontal(|ui| {
+                            ui.label(theme::bold("Thumbnail", 15.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                theme::segmented(ui, &mut view_tall, &[(true, "9:16 Short"), (false, "16:9 video")], false);
+                            });
+                        });
                         let width = ui.available_width();
-                        let (rect, _) = ui.allocate_exact_size(vec2(width, width * 9.0 / 16.0), Sense::hover());
-                        ui.painter().rect_filled(rect, 10, theme::INPUT);
-                        if let Some(tex) = &tex {
-                            egui::Image::new(egui::load::SizedTexture::new(tex.id(), rect.size())).corner_radius(10).paint_at(ui, rect);
-                        } else if thumb_busy {
-                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drawing the thumbnail…", egui::FontId::proportional(14.0), theme::TEXT2);
+                        let shown = if view_tall { &tex_tall } else { &tex };
+                        if view_tall {
+                            let (rect, _) = ui.allocate_exact_size(vec2(width, 420.0), Sense::hover());
+                            ui.painter().rect_filled(rect, 10, theme::INPUT);
+                            let r = egui::Rect::from_center_size(rect.center(), vec2(420.0 * 9.0 / 16.0, 420.0));
+                            if let Some(tex) = shown {
+                                egui::Image::new(egui::load::SizedTexture::new(tex.id(), r.size())).corner_radius(10).paint_at(ui, r);
+                            } else if thumb_busy {
+                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drawing the thumbnail…", egui::FontId::proportional(14.0), theme::TEXT2);
+                            }
+                        } else {
+                            let (rect, _) = ui.allocate_exact_size(vec2(width, width * 9.0 / 16.0), Sense::hover());
+                            ui.painter().rect_filled(rect, 10, theme::INPUT);
+                            if let Some(tex) = shown {
+                                egui::Image::new(egui::load::SizedTexture::new(tex.id(), rect.size())).corner_radius(10).paint_at(ui, rect);
+                            } else if thumb_busy {
+                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drawing the thumbnail…", egui::FontId::proportional(14.0), theme::TEXT2);
+                            }
+                        }
+                        if view_tall {
+                            let mut x = pack.thumb_x.unwrap_or(0.5);
+                            if theme::slider_row(ui, "Where to cut the tall picture (left / right)", &mut x, 0.0..=1.0, 0.5, false) {
+                                pack.thumb_x = Some(x);
+                                changed_x = true;
+                            }
+                            ui.label(theme::muted("The Short thumbnail is cut out of the wide frame. Slide it to keep the action in. The text sits in the middle band, clear of the Shorts buttons."));
                         }
                         if let Some(e) = &thumb_error {
                             ui.label(RichText::new(format!("The thumbnail couldn't be drawn: {e}")).color(theme::BAD).size(12.5));
@@ -346,6 +415,15 @@ impl App {
                         }
                     });
                     ui.add_space(16.0);
+                    let st = self.pack_state(target);
+                    st.view_tall = view_tall;
+                    dirty |= changed_x;
+                    // Redraw once the slider is let go, not on every pixel of the drag.
+                    if dirty && released && !st.tall_busy {
+                        dirty = false;
+                        action = Some(Action::RedrawTall);
+                    }
+                    st.tall_dirty = dirty;
                 });
             });
         }
@@ -356,7 +434,7 @@ impl App {
                 Frame::new().inner_margin(Margin { left: 28, right: 28, top: 16, bottom: 24 }).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(theme::bold("Publish", 18.0));
-                        ui.label(theme::soft("Titles, description and a thumbnail that help people find it"));
+                        ui.label(theme::soft("Titles, description and thumbnails (wide and Short) that help people find it"));
                     });
                     ui.add_space(8.0);
                     theme::card(ui, |ui| {
@@ -504,8 +582,9 @@ impl App {
                 if let Some(pack) = &mut self.pack_state(target).pack {
                     pack.thumb_text = pack::clean_thumb_text(&pack.thumb_text);
                 }
-                self.redraw_thumbnail(target);
+                self.redraw_thumbnail(target, None);
             }
+            Some(Action::RedrawTall) => self.redraw_thumbnail(target, Some(ThumbShape::Tall)),
             Some(Action::Save) => self.save_pack(target),
             None => {}
         }

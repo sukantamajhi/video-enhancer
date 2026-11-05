@@ -55,6 +55,9 @@ pub struct Pack {
     pub hashtags: Vec<String>,
     pub thumb_text: String,
     pub thumb_pick: usize,
+    /// Where the 9:16 Shorts thumbnail is cut from a wide picture: 0 is the left edge, 1 the right. None is the middle.
+    #[serde(default)]
+    pub thumb_x: Option<f32>,
     pub reason: String,
     pub candidates: Vec<Candidate>,
     /// The music credit, when the video uses music that asks for one.
@@ -230,6 +233,7 @@ impl Pack {
             hashtags,
             thumb_text: clean_thumb_text(&ai.thumb_text),
             thumb_pick: ai.thumb_candidate.min(candidates.len() - 1),
+            thumb_x: None,
             reason: tidy(&ai.reason, 240),
             candidates,
             credit,
@@ -380,37 +384,68 @@ fn bold_font() -> Option<PathBuf> {
     found.into_iter().find(|p| p.is_file())
 }
 
-/// The font size that fits the wrapped text across a 1280-wide picture.
-pub fn thumb_font_size(wrapped: &str) -> u32 {
+/// The two thumbnails a pack makes: the wide one for a normal video, the tall one for a Short.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThumbShape {
+    Wide,
+    Tall,
+}
+
+impl ThumbShape {
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            ThumbShape::Wide => (1280, 720),
+            ThumbShape::Tall => (1080, 1920),
+        }
+    }
+}
+
+/// The font size that fits the wrapped text across the picture.
+fn font_size_for(wrapped: &str, shape: ThumbShape) -> u32 {
     let lines = wrapped.lines().count().max(1) as f64;
     let longest = wrapped.lines().map(|l| l.chars().count()).max().unwrap_or(1).max(1) as f64;
     // Impact letters are about half as wide as the font is tall.
-    ((1160.0 / (0.52 * longest)).min(230.0 / lines.sqrt())).max(40.0) as u32
+    let (across, tallest) = match shape {
+        ThumbShape::Wide => (1160.0, 230.0),
+        ThumbShape::Tall => (940.0, 300.0),
+    };
+    ((across / (0.52 * longest)).min(tallest / lines.sqrt())).max(40.0) as u32
 }
 
-/// Draws the thumbnail: 1280x720, the chosen frame in the video's own colour
-/// with extra punch, and big bold text with a dark outline. Returns the JPEG.
-pub fn render_thumbnail(tools: &Tools, candidate: &Candidate, text: &str, workdir: &Path) -> Result<Vec<u8>, String> {
+/// Draws a thumbnail: the chosen frame in the video's own colour with extra punch,
+/// and big bold text with a dark outline. Wide is 1280x720 for YouTube. Tall is
+/// 1080x1920 for a Short, cut out of the frame at `x` (0 left, 1 right), with the
+/// text in the middle band where the Shorts buttons and title don't cover it.
+/// Returns the JPEG.
+pub fn render_thumbnail(tools: &Tools, candidate: &Candidate, text: &str, workdir: &Path, shape: ThumbShape, x: f32) -> Result<Vec<u8>, String> {
     std::fs::create_dir_all(workdir).map_err(|e| e.to_string())?;
     let probe = media::probe(tools, &candidate.clip)?;
     Lut::build(LUT_SIZE, &candidate.grade, candidate.learned.as_ref()).write_cube(&workdir.join("thumb.cube")).map_err(|e| e.to_string())?;
     let text = clean_thumb_text(text);
     let wrapped = wrap_thumb_text(&text);
     let font = bold_font().filter(|_| !wrapped.is_empty());
+    let (w, h) = shape.size();
 
     let mut chain = media::base_filters(&probe);
-    chain.push("scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720".into());
+    match shape {
+        ThumbShape::Wide => chain.push(format!("scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}")),
+        ThumbShape::Tall => chain.push(format!("scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}:(iw-{w})*{:.3}:(ih-{h})/2", x.clamp(0.0, 1.0))),
+    }
     chain.push("format=gbrp,lut3d=file=thumb.cube:interp=tetrahedral".into());
     // A little more punch than the video itself, the way thumbnails need to read at small sizes.
     chain.push("format=yuv444p,eq=contrast=1.08:saturation=1.22".into());
     if let Some(font) = font {
         std::fs::copy(font, workdir.join("font.ttf")).map_err(|e| e.to_string())?;
         std::fs::write(workdir.join("thumb.txt"), &wrapped).map_err(|e| e.to_string())?;
-        let size = thumb_font_size(&wrapped);
-        chain.push("drawbox=x=0:y=ih*0.52:w=iw:h=ih*0.48:color=black@0.32:t=fill".into());
+        let size = font_size_for(&wrapped, shape);
+        let border = (size / 13).max(4);
+        let (band, y) = match shape {
+            ThumbShape::Wide => ("drawbox=x=0:y=ih*0.52:w=iw:h=ih*0.48:color=black@0.32:t=fill", "h-text_h-64"),
+            ThumbShape::Tall => ("drawbox=x=0:y=ih*0.46:w=iw:h=ih*0.30:color=black@0.32:t=fill", "h*0.46+(h*0.30-text_h)/2"),
+        };
+        chain.push(band.into());
         chain.push(format!(
-            "drawtext=fontfile=font.ttf:textfile=thumb.txt:fontsize={size}:fontcolor=0xFFE200:borderw={}:bordercolor=black:shadowcolor=black@0.7:shadowx=7:shadowy=7:line_spacing=-6:x=(w-text_w)/2:y=h-text_h-64",
-            (size / 13).max(4)
+            "drawtext=fontfile=font.ttf:textfile=thumb.txt:fontsize={size}:fontcolor=0xFFE200:borderw={border}:bordercolor=black:shadowcolor=black@0.7:shadowx=7:shadowy=7:line_spacing=-6:x=(w-text_w)/2:y={y}"
         ));
     }
     let output = workdir.join("thumb.jpg");
@@ -492,7 +527,7 @@ mod tests {
         assert_eq!(clean_thumb_text("insane clutch!!! wow, really"), "INSANE CLUTCH!!! WOW");
         assert_eq!(wrap_thumb_text("INSANE CLUTCH"), "INSANE\nCLUTCH");
         assert_eq!(wrap_thumb_text("WOW"), "WOW");
-        assert!(thumb_font_size("INSANE\nCLUTCH") > thumb_font_size("A VERY LONG LINE OF TEXT HERE"));
+        assert!(font_size_for("INSANE\nCLUTCH", ThumbShape::Wide) > font_size_for("A VERY LONG LINE OF TEXT HERE", ThumbShape::Wide));
     }
 
     #[test]
@@ -516,9 +551,9 @@ mod tests {
         let dir = scratch("thumbnail");
         let clip = dir.join("clip.mp4");
         make_video(&tools, &clip, "1920x1080", 6);
-        let plain = render_thumbnail(&tools, &candidate(&clip, 2.0), "", &dir.join("a")).unwrap();
-        let texted = render_thumbnail(&tools, &candidate(&clip, 2.0), "insane clutch", &dir.join("b")).unwrap();
-        let warm = render_thumbnail(&tools, &Candidate { grade: Grade { temperature: 0.8, ..Grade::default() }, ..candidate(&clip, 2.0) }, "insane clutch", &dir.join("c")).unwrap();
+        let plain = render_thumbnail(&tools, &candidate(&clip, 2.0), "", &dir.join("a"), ThumbShape::Wide, 0.5).unwrap();
+        let texted = render_thumbnail(&tools, &candidate(&clip, 2.0), "insane clutch", &dir.join("b"), ThumbShape::Wide, 0.5).unwrap();
+        let warm = render_thumbnail(&tools, &Candidate { grade: Grade { temperature: 0.8, ..Grade::default() }, ..candidate(&clip, 2.0) }, "insane clutch", &dir.join("c"), ThumbShape::Wide, 0.5).unwrap();
         for bytes in [&plain, &texted, &warm] {
             let picture = image::load_from_memory(bytes).expect("a valid JPEG");
             assert_eq!((picture.width(), picture.height()), (1280, 720));
@@ -532,6 +567,31 @@ mod tests {
         // The video's colour grade is applied: a warm grade is redder.
         let reds = |img: &image::RgbImage| img.pixels().map(|p| p[0] as i64 - p[2] as i64).sum::<i64>();
         assert!(reds(&rgb(&warm)) > reds(&b), "the warm grade did not reach the thumbnail");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_shorts_thumbnail_is_tall_cut_where_asked_and_has_text_in_the_middle_band() {
+        let Some(tools) = Tools::find() else { return };
+        let dir = scratch("thumbnail-tall");
+        let clip = dir.join("clip.mp4");
+        make_video(&tools, &clip, "1920x1080", 6);
+        let at = |x: f32, text: &str, name: &str| render_thumbnail(&tools, &candidate(&clip, 2.0), text, &dir.join(name), ThumbShape::Tall, x).unwrap();
+        let (left, right, plain, texted) = (at(0.0, "", "l"), at(1.0, "", "r"), at(0.5, "", "p"), at(0.5, "insane clutch", "t"));
+        let rgb = |b: &[u8]| image::load_from_memory(b).unwrap().to_rgb8();
+        for bytes in [&left, &right, &texted] {
+            let picture = image::load_from_memory(bytes).expect("a valid JPEG");
+            assert_eq!((picture.width(), picture.height()), (1080, 1920));
+            assert!(bytes.len() < 2_000_000);
+        }
+        // The crop really moves across the picture.
+        let sum = |img: &image::RgbImage| img.pixels().map(|p| p[0] as u64 * 3 + p[1] as u64 * 2 + p[2] as u64).sum::<u64>();
+        assert_ne!(sum(&rgb(&left)), sum(&rgb(&right)), "the crop position made no difference");
+        // Yellow letters sit in the middle band (46% to 76% of the height), and nowhere near the bottom fifth.
+        let band = |img: &image::RgbImage, from: u32, to: u32| img.enumerate_pixels().filter(|(_, y, _)| *y >= from && *y < to).map(|(_, _, p)| p[0] as u64 + p[1] as u64).sum::<u64>();
+        let (a, b) = (rgb(&plain), rgb(&texted));
+        assert!(bold_font().is_none() || band(&b, 900, 1400) != band(&a, 900, 1400), "no text in the middle band");
+        assert_eq!(band(&b, 1560, 1920), band(&a, 1560, 1920), "text spilled into the bottom of the Short");
         std::fs::remove_dir_all(&dir).ok();
     }
 
