@@ -67,7 +67,7 @@ fn agent(seconds: u64) -> ureq::Agent {
 }
 
 /// Sends a JSON request and returns the parsed reply, turning API errors into readable text.
-fn post_json(url: &str, headers: &[(&str, String)], body: &Value, seconds: u64) -> Result<Value, String> {
+pub(crate) fn post_json(url: &str, headers: &[(&str, String)], body: &Value, seconds: u64) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
     let mut request = agent(seconds).post(url).header("content-type", "application/json");
     for (name, value) in headers {
@@ -228,7 +228,7 @@ fn suggestion_schema() -> Value {
 }
 
 /// Pulls the answer text out of a Responses API reply.
-fn openai_text(reply: &Value) -> Result<String, String> {
+pub(crate) fn openai_text(reply: &Value) -> Result<String, String> {
     if let Some(error) = reply["error"]["message"].as_str() {
         return Err(error.to_string());
     }

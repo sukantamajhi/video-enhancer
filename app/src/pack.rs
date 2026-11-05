@@ -58,6 +58,14 @@ pub struct Pack {
     /// Where the 9:16 Shorts thumbnail is cut from a wide picture: 0 is the left edge, 1 the right. None is the middle.
     #[serde(default)]
     pub thumb_x: Option<f32>,
+    /// What the creator wants the AI to show off in the thumbnails, in their own words.
+    #[serde(default)]
+    pub thumb_note: String,
+    /// Set when the wide / tall thumbnail was designed by the AI: the key its picture is saved under.
+    #[serde(default)]
+    pub ai_wide: Option<String>,
+    #[serde(default)]
+    pub ai_tall: Option<String>,
     pub reason: String,
     pub candidates: Vec<Candidate>,
     /// The music credit, when the video uses music that asks for one.
@@ -234,6 +242,9 @@ impl Pack {
             thumb_text: clean_thumb_text(&ai.thumb_text),
             thumb_pick: ai.thumb_candidate.min(candidates.len() - 1),
             thumb_x: None,
+            thumb_note: String::new(),
+            ai_wide: None,
+            ai_tall: None,
             reason: tidy(&ai.reason, 240),
             candidates,
             credit,
@@ -426,28 +437,43 @@ pub fn render_thumbnail(tools: &Tools, candidate: &Candidate, text: &str, workdi
     let font = bold_font().filter(|_| !wrapped.is_empty());
     let (w, h) = shape.size();
 
-    let mut chain = media::base_filters(&probe);
-    match shape {
-        ThumbShape::Wide => chain.push(format!("scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}")),
-        ThumbShape::Tall => chain.push(format!("scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}:(iw-{w})*{:.3}:(ih-{h})/2", x.clamp(0.0, 1.0))),
-    }
+    let mut chain = cover_chain(&probe, w, h, shape == ThumbShape::Tall, x);
     chain.push("format=gbrp,lut3d=file=thumb.cube:interp=tetrahedral".into());
     // A little more punch than the video itself, the way thumbnails need to read at small sizes.
-    chain.push("format=yuv444p,eq=contrast=1.08:saturation=1.22".into());
+    chain.push("format=yuv444p,eq=contrast=1.1:saturation=1.25,unsharp=5:5:0.7:5:5:0.0".into());
+    // Darker corners pull the eye to the middle of the picture.
+    chain.push("vignette=angle=0.5".into());
     if let Some(font) = font {
         std::fs::copy(font, workdir.join("font.ttf")).map_err(|e| e.to_string())?;
         std::fs::write(workdir.join("thumb.txt"), &wrapped).map_err(|e| e.to_string())?;
         let size = font_size_for(&wrapped, shape);
         let border = (size / 13).max(4);
-        let (band, y) = match shape {
-            ThumbShape::Wide => ("drawbox=x=0:y=ih*0.52:w=iw:h=ih*0.48:color=black@0.32:t=fill", "h-text_h-64"),
-            ThumbShape::Tall => ("drawbox=x=0:y=ih*0.46:w=iw:h=ih*0.30:color=black@0.32:t=fill", "h*0.46+(h*0.30-text_h)/2"),
+        // A soft shade behind the words, fading in and out, in place of a hard-edged box. Only the brightness changes.
+        let (scrim, y) = match shape {
+            ThumbShape::Wide => ("min(1,max(0,(Y/H-0.45)/0.30))", "h-text_h-64"),
+            ThumbShape::Tall => ("min(1,max(0,(Y/H-0.36)/0.12))*min(1,max(0,(0.82-Y/H)/0.10))", "h*0.46+(h*0.30-text_h)/2"),
         };
-        chain.push(band.into());
+        chain.push(format!("geq=lum='lum(X,Y)*(1-0.5*{scrim})':cb='cb(X,Y)':cr='cr(X,Y)'"));
         chain.push(format!(
             "drawtext=fontfile=font.ttf:textfile=thumb.txt:fontsize={size}:fontcolor=0xFFE200:borderw={border}:bordercolor=black:shadowcolor=black@0.7:shadowx=7:shadowy=7:line_spacing=-6:x=(w-text_w)/2:y={y}"
         ));
     }
+    run_chain(tools, candidate, &chain, workdir)
+}
+
+/// The filters that cut the video's picture to exactly `w` x `h`. A tall cut is taken at `x` across a wide picture.
+fn cover_chain(probe: &media::Probe, w: u32, h: u32, tall: bool, x: f32) -> Vec<String> {
+    let mut chain = media::base_filters(probe);
+    if tall {
+        chain.push(format!("scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}:(iw-{w})*{:.3}:(ih-{h})/2", x.clamp(0.0, 1.0)));
+    } else {
+        chain.push(format!("scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}"));
+    }
+    chain
+}
+
+/// Runs the filters on the candidate's frame and returns a JPEG under YouTube's 2 MB limit.
+fn run_chain(tools: &Tools, candidate: &Candidate, chain: &[String], workdir: &Path) -> Result<Vec<u8>, String> {
     let output = workdir.join("thumb.jpg");
     // JPEG is full range and brightness is judged by the same matrix everywhere, so no video colour tags here.
     let mut quality = 2;
@@ -471,6 +497,19 @@ pub fn render_thumbnail(tools: &Tools, candidate: &Candidate, text: &str, workdi
         }
         quality += 3;
     }
+}
+
+/// The video's own frame at the size the AI is asked to design at, in the video's colour, with nothing
+/// added: this is the picture sent to OpenAI. A tall one is cut at `x` across the wide picture.
+pub fn base_frame(tools: &Tools, candidate: &Candidate, shape: ThumbShape, x: f32, workdir: &Path) -> Result<Vec<u8>, String> {
+    std::fs::create_dir_all(workdir).map_err(|e| e.to_string())?;
+    let probe = media::probe(tools, &candidate.clip)?;
+    Lut::build(LUT_SIZE, &candidate.grade, candidate.learned.as_ref()).write_cube(&workdir.join("thumb.cube")).map_err(|e| e.to_string())?;
+    let (w, h) = crate::thumb_ai::ai_size(shape);
+    let mut chain = cover_chain(&probe, w, h, shape == ThumbShape::Tall, x);
+    chain.push("format=gbrp,lut3d=file=thumb.cube:interp=tetrahedral".into());
+    chain.push("format=yuv444p".into());
+    run_chain(tools, candidate, &chain, workdir)
 }
 
 #[cfg(test)]
@@ -591,7 +630,31 @@ mod tests {
         let band = |img: &image::RgbImage, from: u32, to: u32| img.enumerate_pixels().filter(|(_, y, _)| *y >= from && *y < to).map(|(_, _, p)| p[0] as u64 + p[1] as u64).sum::<u64>();
         let (a, b) = (rgb(&plain), rgb(&texted));
         assert!(bold_font().is_none() || band(&b, 900, 1400) != band(&a, 900, 1400), "no text in the middle band");
-        assert_eq!(band(&b, 1560, 1920), band(&a, 1560, 1920), "text spilled into the bottom of the Short");
+        assert_eq!(band(&b, 1620, 1920), band(&a, 1620, 1920), "text or shade spilled into the bottom of the Short");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_frames_sent_to_the_ai_are_the_right_size_in_the_videos_colour_with_nothing_drawn_on() {
+        let Some(tools) = Tools::find() else { return };
+        let dir = scratch("base-frames");
+        let clip = dir.join("clip.mp4");
+        make_video(&tools, &clip, "1920x1080", 6);
+        let size = |b: &[u8]| image::load_from_memory(b).map(|i| (i.width(), i.height())).unwrap();
+        let rgb = |b: &[u8]| image::load_from_memory(b).unwrap().to_rgb8();
+        let wide = base_frame(&tools, &candidate(&clip, 2.0), ThumbShape::Wide, 0.5, &dir.join("w")).unwrap();
+        let tall = base_frame(&tools, &candidate(&clip, 2.0), ThumbShape::Tall, 0.5, &dir.join("t")).unwrap();
+        assert_eq!((size(&wide), size(&tall)), ((1536, 864), (1088, 1920)));
+        // The tall cut moves with x, and the video's grade is in the picture the AI gets.
+        let left = base_frame(&tools, &candidate(&clip, 2.0), ThumbShape::Tall, 0.0, &dir.join("l")).unwrap();
+        let right = base_frame(&tools, &candidate(&clip, 2.0), ThumbShape::Tall, 1.0, &dir.join("r")).unwrap();
+        assert_ne!(rgb(&left).as_raw(), rgb(&right).as_raw(), "the cut position made no difference");
+        let warm = base_frame(&tools, &Candidate { grade: Grade { temperature: 0.8, ..Grade::default() }, ..candidate(&clip, 2.0) }, ThumbShape::Wide, 0.5, &dir.join("g")).unwrap();
+        let reds = |img: &image::RgbImage| img.pixels().map(|p| p[0] as i64 - p[2] as i64).sum::<i64>();
+        assert!(reds(&rgb(&warm)) > reds(&rgb(&wide)), "the grade did not reach the picture sent to the AI");
+        // Nothing is drawn on it: no yellow lettering band, unlike the plain thumbnail.
+        let plain = render_thumbnail(&tools, &candidate(&clip, 2.0), "insane clutch", &dir.join("p"), ThumbShape::Wide, 0.5).unwrap();
+        assert_ne!(rgb(&wide).as_raw()[..1000], rgb(&plain).as_raw()[..1000]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

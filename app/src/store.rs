@@ -59,6 +59,27 @@ pub fn load_in<T: DeserializeOwned>(dir: &Path, name: &str) -> Option<T> {
     serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.json"))).ok()?).ok()
 }
 
+/// A short fingerprint of some bytes, such as a picture.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes)[..10])
+}
+
+/// Saves a picture or other file as it is, the same careful way: a temporary file first, then a rename.
+pub fn save_bytes_in(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let (part, target) = (dir.join(format!("{name}.part")), dir.join(format!("{name}.jpg")));
+    std::fs::write(&part, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&part, &target).map_err(|e| e.to_string())
+}
+
+pub fn load_bytes_in(dir: &Path, name: &str) -> Option<Vec<u8>> {
+    std::fs::read(dir.join(format!("{name}.jpg"))).ok().filter(|b| !b.is_empty())
+}
+
+pub fn load_bytes(name: &str) -> Option<Vec<u8>> {
+    load_bytes_in(&dir(), name)
+}
+
 pub fn save<T: Serialize>(name: &str, value: &T) {
     // Saving is a convenience. If the disk is full or locked, the app carries on.
     let _ = save_in(&dir(), name, value);

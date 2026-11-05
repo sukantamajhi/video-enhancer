@@ -12,6 +12,7 @@ mod pack_ui;
 mod sample;
 mod screens;
 mod store;
+mod thumb_ai;
 mod theme;
 
 use std::path::PathBuf;
@@ -152,6 +153,8 @@ struct Settings {
     pack_topic: String,
     pack_format: pack::PackFormat,
     recent: Vec<Recent>,
+    thumb_model: usize,
+    thumb_quality: usize,
 }
 
 impl Default for Settings {
@@ -173,6 +176,8 @@ impl Default for Settings {
             pack_topic: String::new(),
             pack_format: pack::PackFormat::Standard,
             recent: Vec::new(),
+            thumb_model: 0,
+            thumb_quality: 1,
         }
     }
 }
@@ -265,6 +270,9 @@ struct App {
     more_colour_open: bool,
     finish_open: bool,
     activity: Option<Vec<f32>>,
+    thumb_model: usize,
+    thumb_quality: usize,
+    confirm_ai_thumb: Option<pack_ui::Target>,
 }
 
 fn main() -> eframe::Result {
@@ -360,6 +368,9 @@ impl App {
             more_colour_open: false,
             finish_open: false,
             activity: None,
+            thumb_model: 0,
+            thumb_quality: 1,
+            confirm_ai_thumb: None,
         };
         app.use_sample();
         app.status = if app.tools.is_some() {
@@ -380,6 +391,14 @@ impl App {
                 "publish" => Step::Publish,
                 _ => app.step,
             };
+        }
+        // Developer aid: VE_AUTO_AI=1 starts the AI thumbnails at once, for testing against a stand-in server.
+        if std::env::var_os("VE_AUTO_AI").is_some() {
+            app.start_ai_thumbnails(if app.mode == Mode::Montage { pack_ui::Target::Montage } else { pack_ui::Target::Single });
+        }
+        // Developer aid: VE_CONFIRM_AI=1 opens the "design with OpenAI?" question, for screenshots.
+        if std::env::var_os("VE_CONFIRM_AI").is_some() {
+            app.confirm_ai_thumb = Some(if app.mode == Mode::Montage { pack_ui::Target::Montage } else { pack_ui::Target::Single });
         }
         app.detect_encoders();
         app.detect_gpu();
@@ -419,6 +438,8 @@ impl App {
             pack_topic: self.pack_topic.clone(),
             pack_format: self.pack_format,
             recent: self.recent.clone(),
+            thumb_model: self.thumb_model,
+            thumb_quality: self.thumb_quality,
         }
     }
 
@@ -458,6 +479,8 @@ impl App {
             self.pack_topic = s.pack_topic;
             self.pack_format = s.pack_format;
             self.recent = s.recent.into_iter().filter(|r| r.path.is_file()).collect();
+            self.thumb_model = s.thumb_model.min(thumb_ai::IMAGE_MODELS.len() - 1);
+            self.thumb_quality = s.thumb_quality.min(thumb_ai::QUALITIES.len() - 1);
             if std::env::var_os("VE_MONTAGE").is_none() && s.montage {
                 self.mode = Mode::Montage;
             }
@@ -1091,6 +1114,30 @@ impl eframe::App for App {
                     }
                     if ui.button("Cancel").clicked() {
                         self.confirm_omni = false;
+                    }
+                });
+            });
+        }
+
+        if let Some(target) = self.confirm_ai_thumb {
+            egui::Window::new("Design the thumbnails with OpenAI?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| {
+                ui.set_width(470.0);
+                ui.label(theme::soft("This sends these to OpenAI, using your key:"));
+                ui.label(theme::soft("  •  the frame you picked from your video, as a 16:9 picture and a 9:16 picture"));
+                ui.label(theme::soft("  •  the words for the thumbnail and the game or topic"));
+                ui.label(theme::soft("  •  anything you typed under \"Anything to show off\""));
+                ui.add_space(4.0);
+                ui.label(theme::soft(format!("Model: {}. Quality: {}.", thumb_ai::IMAGE_MODELS[self.thumb_model.min(1)].1, thumb_ai::QUALITIES[self.thumb_quality.min(2)].1)));
+                ui.label(theme::soft("OpenAI charges for each of the two pictures, by size and quality (image output costs $30 per million tokens). The app shows the real cost afterwards, taken from OpenAI's own usage report."));
+                ui.label(theme::soft("If the lettering comes out misspelled, one more try is made automatically, and it is charged too. Asking again with nothing changed reuses the saved pictures and costs nothing."));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if theme::button(ui, "Send it", theme::Kind::Primary, 0.0).clicked() {
+                        self.confirm_ai_thumb = None;
+                        self.start_ai_thumbnails(target);
+                    }
+                    if theme::button(ui, "Cancel", theme::Kind::Secondary, 0.0).clicked() {
+                        self.confirm_ai_thumb = None;
                     }
                 });
             });

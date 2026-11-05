@@ -1098,7 +1098,7 @@ impl App {
     }
 
     pub fn pack_busy_text(&self) -> Option<String> {
-        self.pack1.busy.clone().or_else(|| self.mon.pack_busy())
+        self.pack1.status().or_else(|| self.mon.pack_busy())
     }
 }
 

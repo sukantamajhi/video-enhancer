@@ -10,7 +10,8 @@ use crate::grade::Grade;
 use crate::media::{self, Finish, GrabOptions};
 use crate::montage::{self, Cut, Style};
 use crate::pack::{self, Candidate, Level, Pack, PackFormat, Segment, ThumbShape};
-use crate::theme::{self, Kind};
+use crate::theme::{self, Icon, Kind};
+use crate::thumb_ai;
 use crate::{App, Msg, Step, ai, store};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,6 +24,10 @@ pub enum Event {
     /// The pack, its wide and tall thumbnail pictures, and whether a saved answer was reused.
     Made(Target, Result<(Pack, Vec<u8>, Vec<u8>, bool), String>),
     Thumb(Target, ThumbShape, Result<Vec<u8>, String>),
+    /// One AI-designed thumbnail is done, or failed.
+    AiThumb(Target, ThumbShape, Result<thumb_ai::Made, String>),
+    /// What the AI job is doing now, for the progress card.
+    AiNote(Target, String),
 }
 
 /// What the montage screen can say about the finished video, for chapters and thumbnails.
@@ -55,6 +60,13 @@ pub struct PackState {
     pub view_tall: bool,
     /// The crop slider moved and the picture hasn't been redrawn yet.
     pub tall_dirty: bool,
+    /// While the AI is designing the thumbnails: what it is doing.
+    pub ai_busy: Option<String>,
+    pub ai_pending: u8,
+    /// What the AI thumbnails cost this time, in dollars, from OpenAI's own usage report.
+    pub ai_cost: f64,
+    pub ai_reused: bool,
+    pub ai_warnings: Vec<String>,
 }
 
 impl PackState {
@@ -63,7 +75,12 @@ impl PackState {
     }
 
     pub fn working(&self) -> bool {
-        self.busy.is_some() || self.thumb_busy || self.tall_busy
+        self.busy.is_some() || self.thumb_busy || self.tall_busy || self.ai_busy.is_some()
+    }
+
+    /// What to show on the progress card, if anything is running.
+    pub fn status(&self) -> Option<String> {
+        self.busy.clone().or_else(|| self.ai_busy.clone())
     }
 }
 
@@ -80,6 +97,8 @@ enum Action {
     Write,
     Redraw,
     RedrawTall,
+    /// Draw just these again (a pack that came back from last time, missing some pictures).
+    Restore(Vec<ThumbShape>),
     Save,
 }
 
@@ -98,11 +117,55 @@ impl App {
                 st.view_tall = pack.format == PackFormat::Short;
                 (st.busy, st.pack, st.thumb, st.tex, st.thumb_error, st.auto_tried) = (None, Some(pack), Some(jpeg), None, None, true);
                 (st.thumb_tall, st.tex_tall, st.tall_busy) = (Some(tall), None, false);
+                (st.ai_busy, st.ai_pending, st.ai_cost, st.ai_reused) = (None, 0, 0.0, false);
+                st.ai_warnings.clear();
                 self.note(if reused { "Upload pack ready. Reused your saved AI answer, so no tokens were used." } else { "Upload pack ready. Edit anything, then save it." });
             }
             Event::Made(target, Err(e)) => {
                 self.pack_state(target).busy = None;
                 self.fail(e);
+            }
+            Event::AiNote(target, text) => {
+                let st = self.pack_state(target);
+                if st.ai_pending > 0 {
+                    st.ai_busy = Some(text);
+                }
+            }
+            Event::AiThumb(target, shape, result) => {
+                let st = self.pack_state(target);
+                st.ai_pending = st.ai_pending.saturating_sub(1);
+                let mut failure = None;
+                match result {
+                    Ok(made) => {
+                        match shape {
+                            ThumbShape::Wide => (st.thumb, st.tex) = (Some(made.jpeg), None),
+                            ThumbShape::Tall => (st.thumb_tall, st.tex_tall) = (Some(made.jpeg), None),
+                        }
+                        if let Some(p) = &mut st.pack {
+                            match shape {
+                                ThumbShape::Wide => p.ai_wide = Some(made.name),
+                                ThumbShape::Tall => p.ai_tall = Some(made.name),
+                            }
+                        }
+                        st.ai_cost += made.cost.unwrap_or(0.0);
+                        st.ai_reused |= made.reused;
+                        st.ai_warnings.extend(made.warning);
+                    }
+                    Err(e) => failure = Some(e),
+                }
+                let done = st.ai_pending == 0;
+                if done {
+                    st.ai_busy = None;
+                }
+                let (cost, reused, warned) = (st.ai_cost, st.ai_reused, !st.ai_warnings.is_empty());
+                if let Some(e) = failure {
+                    self.pack_state(target).thumb_error = Some(e.clone());
+                    self.fail(e);
+                } else if done {
+                    let spent = if cost > 0.0 { format!(" It cost about ${cost:.2}, worked out from OpenAI's own usage report.") } else if reused { " Reused your saved pictures, so nothing was charged.".to_string() } else { String::new() };
+                    let check = if warned { " Check the warning under the picture." } else { "" };
+                    self.note(format!("The AI designed both thumbnails.{spent}{check}"));
+                }
             }
             Event::Thumb(target, shape, result) => {
                 let st = self.pack_state(target);
@@ -205,17 +268,21 @@ impl App {
         });
     }
 
-    /// Draws the thumbnails again: both shapes, or just the one that changed.
-    fn redraw_thumbnail(&mut self, target: Target, only: Option<ThumbShape>) {
+    /// Draws the plain (free) thumbnails again, for the shapes given. An AI picture for a shape is replaced.
+    fn redraw_thumbnail(&mut self, target: Target, shapes: Vec<ThumbShape>) {
         let Some(tools) = self.tools.clone() else { return };
         let st = self.pack_state(target);
         let Some(pack) = &st.pack else { return };
         let (candidate, text, x) = (pack.candidates.get(pack.thumb_pick).cloned(), pack.thumb_text.clone(), pack.thumb_x.unwrap_or(0.5));
         let Some(candidate) = candidate else { return };
-        let shapes: Vec<ThumbShape> = match only {
-            Some(s) => vec![s],
-            None => vec![ThumbShape::Wide, ThumbShape::Tall],
-        };
+        if let Some(p) = &mut st.pack {
+            for shape in &shapes {
+                match shape {
+                    ThumbShape::Wide => p.ai_wide = None,
+                    ThumbShape::Tall => p.ai_tall = None,
+                }
+            }
+        }
         for shape in &shapes {
             match shape {
                 ThumbShape::Wide => st.thumb_busy = true,
@@ -231,6 +298,41 @@ impl App {
             }
             std::fs::remove_dir_all(&work).ok();
         });
+    }
+
+    /// Sends the chosen frame and the words to OpenAI to design both thumbnails, one request per shape, side by side.
+    pub fn start_ai_thumbnails(&mut self, target: Target) {
+        let Some(tools) = self.tools.clone() else { return };
+        let Some(key) = ai::load_key(ai::Provider::OpenAi) else {
+            self.fail("Add your OpenAI key first (Settings, top right).");
+            return;
+        };
+        let (model, quality) = (thumb_ai::IMAGE_MODELS[self.thumb_model.min(thumb_ai::IMAGE_MODELS.len() - 1)].0, thumb_ai::QUALITIES[self.thumb_quality.min(thumb_ai::QUALITIES.len() - 1)].0);
+        let (text_model, topic, reuse, mail) = (ai::OPENAI_MODELS[self.openai_model].0, self.pack_topic.trim().to_string(), self.reuse_ai, self.mail.clone());
+        let st = self.pack_state(target);
+        if st.ai_busy.is_some() {
+            return;
+        }
+        let Some(pack) = &st.pack else { return };
+        let Some(candidate) = pack.candidates.get(pack.thumb_pick).cloned() else { return };
+        let brief = thumb_ai::Brief { text: pack::clean_thumb_text(&pack.thumb_text), topic, direction: pack.thumb_note.clone(), format: pack.format };
+        let x = pack.thumb_x.unwrap_or(0.5);
+        (st.ai_busy, st.ai_pending, st.ai_cost, st.ai_reused, st.thumb_error) = (Some("Getting the frames ready…".into()), 2, 0.0, false, None);
+        st.ai_warnings.clear();
+        for shape in [ThumbShape::Wide, ThumbShape::Tall] {
+            let (tools, key, candidate, brief, mail) = (tools.clone(), key.clone(), candidate.clone(), brief.clone(), mail.clone());
+            let (model, quality, text_model) = (model.to_string(), quality.to_string(), text_model.to_string());
+            std::thread::spawn(move || {
+                let work = std::env::temp_dir().join(format!("video-enhancer-ai-thumb-{}-{target:?}-{shape:?}", std::process::id()));
+                let result = (|| {
+                    let frame = pack::base_frame(&tools, &candidate, shape, x, &work)?;
+                    let job = thumb_ai::Job { base: thumb_ai::api_base(), key, model, quality, text_model, shape, brief, frame, reuse, cache_dir: store::dir() };
+                    thumb_ai::run(&job, &|text| mail.send(Msg::Pack(Event::AiNote(target, text.to_string()))))
+                })();
+                std::fs::remove_dir_all(&work).ok();
+                mail.send(Msg::Pack(Event::AiThumb(target, shape, result)));
+            });
+        }
     }
 
     fn save_pack(&mut self, target: Target) {
@@ -303,7 +405,21 @@ impl App {
                 st.auto_tried = true;
                 // A pack for a Short opens on the tall thumbnail.
                 st.view_tall = st.pack.as_ref().is_some_and(|p| p.format == PackFormat::Short);
-                action = Some(Action::Redraw);
+                // Pictures the AI designed earlier come back from disk, free. The others are drawn plainly.
+                let mut missing = Vec::new();
+                if let Some(p) = &mut st.pack {
+                    match p.ai_wide.as_deref().and_then(store::load_bytes) {
+                        Some(bytes) => (st.thumb, st.tex) = (Some(bytes), None),
+                        None => (p.ai_wide, missing) = (None, [missing, vec![ThumbShape::Wide]].concat()),
+                    }
+                    match p.ai_tall.as_deref().and_then(store::load_bytes) {
+                        Some(bytes) => (st.thumb_tall, st.tex_tall) = (Some(bytes), None),
+                        None => (p.ai_tall, missing) = (None, [missing, vec![ThumbShape::Tall]].concat()),
+                    }
+                }
+                if !missing.is_empty() {
+                    action = Some(Action::Restore(missing));
+                }
             }
             (st.busy.clone(), st.pack.is_some())
         };
@@ -318,34 +434,18 @@ impl App {
                 });
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.add_space(16.0);
+                    let (mut model_i, mut quality_i) = (self.thumb_model, self.thumb_quality);
                     let st = self.pack_state(target);
-                    let (thumb_busy, tex, thumb_error) = (st.thumb_busy || st.tall_busy, st.tex.clone(), st.thumb_error.clone());
+                    let (ai_busy, ai_cost, ai_reused, ai_warnings) = (st.ai_busy.clone(), st.ai_cost, st.ai_reused, st.ai_warnings.clone());
+                    let (thumb_busy, tex, thumb_error) = (st.thumb_busy || st.tall_busy || st.ai_busy.is_some(), st.tex.clone(), st.thumb_error.clone());
                     let (tex_tall, mut view_tall) = (st.tex_tall.clone(), st.view_tall);
                     let mut dirty = st.tall_dirty;
                     let released = !ui.input(|i| i.pointer.any_down());
                     let mut changed_x = false;
+                    let mut ask_ai = false;
                     let Some(pack) = &mut st.pack else { return };
                     let checks = pack.seo_checks();
                     let good = checks.iter().filter(|c| c.level == Level::Good).count();
-                    theme::card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            theme::ring(ui, good, checks.len());
-                            ui.vertical(|ui| {
-                                ui.label(theme::bold("Search check", 15.0));
-                                ui.label(theme::muted("Updates as you edit"));
-                                ui.label(theme::soft(if good == checks.len() { "Everything YouTube likes is in place." } else { "A few things could help it get found." }));
-                            });
-                        });
-                        ui.add_space(4.0);
-                        for check in &checks {
-                            let level = match check.level {
-                                Level::Good => theme::Level::Good,
-                                Level::Warn => theme::Level::Warn,
-                                Level::Bad => theme::Level::Bad,
-                            };
-                            theme::status_row(ui, level, &check.text);
-                        }
-                    });
                     theme::card(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(theme::bold("Thumbnail", 15.0));
@@ -373,6 +473,23 @@ impl App {
                                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drawing the thumbnail…", egui::FontId::proportional(14.0), theme::TEXT2);
                             }
                         }
+                        // A plain frame with words on it is only a draft. The AI design is the real thumbnail.
+                        let designed = if view_tall { pack.ai_tall.is_some() } else { pack.ai_wide.is_some() };
+                        ui.horizontal(|ui| {
+                            if designed {
+                                theme::pill(ui, "AI designed", theme::ACCENT_TEXT, theme::accent_soft(40), None);
+                            } else {
+                                theme::pill(ui, "Free draft", theme::TEXT2, theme::INPUT, None);
+                                ui.label(theme::muted("Just your frame and words."));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_enabled_ui(has_key && !thumb_busy, |ui| {
+                                    if theme::small_button(ui, if designed { "Design again" } else { "Design with AI" }).clicked() {
+                                        ask_ai = true;
+                                    }
+                                });
+                            });
+                        });
                         if view_tall {
                             let mut x = pack.thumb_x.unwrap_or(0.5);
                             if theme::slider_row(ui, "Where to cut the tall picture (left / right)", &mut x, 0.0..=1.0, 0.5, false) {
@@ -388,7 +505,7 @@ impl App {
                             ui.label(theme::soft("Words on it"));
                             ui.add(egui::TextEdit::singleline(&mut pack.thumb_text).desired_width(ui.available_width() - 90.0).margin(Margin::symmetric(10, 8)));
                             ui.add_enabled_ui(!thumb_busy, |ui| {
-                                if theme::small_button(ui, "Redraw").clicked() {
+                                if theme::small_button(ui, "Redraw (free)").clicked() {
                                     action = Some(Action::Redraw);
                                 }
                             });
@@ -414,9 +531,82 @@ impl App {
                             ui.label(theme::muted(format!("Why this frame: {}", pack.reason)));
                         }
                     });
+                    theme::card_with(ui, theme::accent_soft(14), theme::accent_soft(70), |ui| {
+                        ui.horizontal(|ui| {
+                            theme::icon(ui, Icon::Sparkle, 16.0, theme::ACCENT_TEXT);
+                            ui.label(theme::bold("Design both with AI", 14.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if pack.ai_wide.is_some() || pack.ai_tall.is_some() {
+                                    theme::pill(ui, "AI designed", theme::ACCENT_TEXT, theme::accent_soft(40), None);
+                                }
+                            });
+                        });
+                        ui.label(theme::muted("Sends the frame you picked (a 16:9 and a 9:16 version), your words and the game to OpenAI, which designs a thumbnail for each shape. The pictures stay true to your video. It costs money, and you see the real cost afterwards."));
+                        ui.label(theme::soft("Anything to show off? (optional)"));
+                        ui.add(egui::TextEdit::singleline(&mut pack.thumb_note).hint_text("for example: make the explosion bigger").desired_width(f32::INFINITY).margin(Margin::symmetric(10, 8)));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            egui::ComboBox::from_id_salt("thumb_model").selected_text(thumb_ai::IMAGE_MODELS[model_i.min(1)].1).width(170.0).show_ui(ui, |ui| {
+                                for (i, (_, name)) in thumb_ai::IMAGE_MODELS.iter().enumerate() {
+                                    ui.selectable_value(&mut model_i, i, *name);
+                                }
+                            });
+                            egui::ComboBox::from_id_salt("thumb_quality").selected_text(thumb_ai::QUALITIES[quality_i.min(2)].1).width(150.0).show_ui(ui, |ui| {
+                                for (i, (_, name)) in thumb_ai::QUALITIES.iter().enumerate() {
+                                    ui.selectable_value(&mut quality_i, i, *name);
+                                }
+                            });
+                        });
+                        ui.add_enabled_ui(has_key && !thumb_busy, |ui| {
+                            if theme::button_with_icon(ui, if ai_busy.is_some() { "Designing…" } else { "Make both with AI" }, None, Kind::Primary, ui.available_width()).clicked() {
+                                ask_ai = true;
+                            }
+                        });
+                        if !has_key {
+                            ui.label(theme::muted("Needs your OpenAI key (Settings, top right)."));
+                        }
+                        if let Some(text) = &ai_busy {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(theme::soft(text));
+                            });
+                        }
+                        for warning in &ai_warnings {
+                            ui.add(egui::Label::new(RichText::new(warning).size(12.5).color(theme::WARN)).wrap());
+                        }
+                        if ai_cost > 0.0 && ai_busy.is_none() {
+                            ui.label(theme::muted(format!("This time it cost about ${ai_cost:.2} (from OpenAI's usage report).")));
+                        } else if ai_reused && ai_busy.is_none() {
+                            ui.label(theme::muted("Reused your saved pictures. Nothing was charged."));
+                        }
+                    });
+                    theme::card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            theme::ring(ui, good, checks.len());
+                            ui.vertical(|ui| {
+                                ui.label(theme::bold("Search check", 15.0));
+                                ui.label(theme::muted("Updates as you edit"));
+                                ui.label(theme::soft(if good == checks.len() { "Everything YouTube likes is in place." } else { "A few things could help it get found." }));
+                            });
+                        });
+                        ui.add_space(4.0);
+                        for check in &checks {
+                            let level = match check.level {
+                                Level::Good => theme::Level::Good,
+                                Level::Warn => theme::Level::Warn,
+                                Level::Bad => theme::Level::Bad,
+                            };
+                            theme::status_row(ui, level, &check.text);
+                        }
+                    });
                     ui.add_space(16.0);
                     let st = self.pack_state(target);
                     st.view_tall = view_tall;
+                    (self.thumb_model, self.thumb_quality) = (model_i, quality_i);
+                    if ask_ai {
+                        self.confirm_ai_thumb = Some(target);
+                    }
+                    let st = self.pack_state(target);
                     dirty |= changed_x;
                     // Redraw once the slider is let go, not on every pixel of the drag.
                     if dirty && released && !st.tall_busy {
@@ -582,9 +772,10 @@ impl App {
                 if let Some(pack) = &mut self.pack_state(target).pack {
                     pack.thumb_text = pack::clean_thumb_text(&pack.thumb_text);
                 }
-                self.redraw_thumbnail(target, None);
+                self.redraw_thumbnail(target, vec![ThumbShape::Wide, ThumbShape::Tall]);
             }
-            Some(Action::RedrawTall) => self.redraw_thumbnail(target, Some(ThumbShape::Tall)),
+            Some(Action::RedrawTall) => self.redraw_thumbnail(target, vec![ThumbShape::Tall]),
+            Some(Action::Restore(shapes)) => self.redraw_thumbnail(target, shapes),
             Some(Action::Save) => self.save_pack(target),
             None => {}
         }

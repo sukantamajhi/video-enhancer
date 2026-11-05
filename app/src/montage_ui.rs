@@ -248,7 +248,7 @@ impl State {
     }
 
     pub fn pack_busy(&self) -> Option<String> {
-        self.pack.busy.clone()
+        self.pack.status()
     }
 
     fn total(&self) -> f64 {
