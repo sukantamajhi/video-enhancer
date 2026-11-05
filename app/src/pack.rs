@@ -80,8 +80,6 @@ pub enum PackFormat {
 }
 
 impl PackFormat {
-    pub const ALL: [PackFormat; 2] = [PackFormat::Standard, PackFormat::Short];
-
     pub fn name(self) -> &'static str {
         match self {
             PackFormat::Standard => "Standard video (16:9)",

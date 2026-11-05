@@ -10,14 +10,16 @@ mod music;
 mod pack;
 mod pack_ui;
 mod sample;
+mod screens;
 mod store;
+mod theme;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-use eframe::egui::{self, Color32, RichText, pos2, vec2};
+use eframe::egui;
 use grade::{Grade, LOOKS, LUT_SIZE, LearnedLook, Lut};
 use serde::{Deserialize, Serialize};
 use media::{BlurLayout, Encoder, EncoderChoice, ExportJob, Finish, Frame, Framing, GrabOptions, Player, Probe, Shape, Tools};
@@ -83,6 +85,24 @@ enum Compare {
     After,
 }
 
+/// The four stops on the workflow rail. Video and Montage mean different things by the first three.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Source = 0,
+    Look = 1,
+    Export = 2,
+    Publish = 3,
+}
+
+/// A video opened before, for the Start screen.
+#[derive(Clone, Serialize, Deserialize)]
+struct Recent {
+    path: PathBuf,
+    duration: f64,
+    height: u32,
+    fps: f64,
+}
+
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum VerticalFraming {
     Centre,
@@ -131,6 +151,7 @@ struct Settings {
     gpu_grade: bool,
     pack_topic: String,
     pack_format: pack::PackFormat,
+    recent: Vec<Recent>,
 }
 
 impl Default for Settings {
@@ -151,6 +172,7 @@ impl Default for Settings {
             gpu_grade: true,
             pack_topic: String::new(),
             pack_format: pack::PackFormat::Standard,
+            recent: Vec::new(),
         }
     }
 }
@@ -193,7 +215,6 @@ struct App {
     lut_for: (Grade, Option<LearnedLook>),
     compare: Compare,
     split: f32,
-    show_guide: bool,
 
     wants_wide: bool,
     wide_height: u32,
@@ -236,6 +257,14 @@ struct App {
     reuse_ai: bool,
     last_save: f64,
     saved: [String; 3],
+    step: Step,
+    show_settings: bool,
+    recent: Vec<Recent>,
+    look_tex: Vec<egui::TextureHandle>,
+    looks_dirty: bool,
+    more_colour_open: bool,
+    finish_open: bool,
+    activity: Option<Vec<f32>>,
 }
 
 fn main() -> eframe::Result {
@@ -255,14 +284,7 @@ fn clock(t: f64) -> String {
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.selection.bg_fill = Color32::from_rgb(214, 92, 51);
-        visuals.hyperlink_color = Color32::from_rgb(240, 140, 100);
-        ctx.set_visuals(visuals);
-        ctx.global_style_mut(|s| {
-            s.spacing.item_spacing = vec2(8.0, 6.0);
-            s.spacing.slider_width = 150.0;
-        });
+        theme::apply(ctx);
 
         let (tx, rx) = mpsc::channel();
         let grade = Grade::default();
@@ -291,7 +313,6 @@ impl App {
             lut_for: (grade, None),
             compare: Compare::Split,
             split: 0.5,
-            show_guide: true,
             wants_wide: true,
             wide_height: 0,
             wants_vertical: true,
@@ -331,10 +352,18 @@ impl App {
             reuse_ai: true,
             last_save: 0.0,
             saved: Default::default(),
+            step: Step::Source,
+            show_settings: false,
+            recent: Vec::new(),
+            look_tex: Vec::new(),
+            looks_dirty: true,
+            more_colour_open: false,
+            finish_open: false,
+            activity: None,
         };
         app.use_sample();
         app.status = if app.tools.is_some() {
-            "Drop a video here, or press Open video. The sample picture below lets you try the controls.".into()
+            "Drop a video here, or press Open a video.".into()
         } else {
             "The video tools aren't installed yet. Press the download button on the left to get them (one time, about 110 MB).".into()
         };
@@ -342,6 +371,16 @@ impl App {
             app.shot = Some((path.into(), n.parse().unwrap_or(12)));
         }
         app.restore();
+        // Developer aid: VE_STEP=look|export|publish opens that step, for screenshots.
+        if let Ok(step) = std::env::var("VE_STEP") {
+            app.step = match step.as_str() {
+                "source" => Step::Source,
+                "look" => Step::Look,
+                "export" => Step::Export,
+                "publish" => Step::Publish,
+                _ => app.step,
+            };
+        }
         app.detect_encoders();
         app.detect_gpu();
         app
@@ -379,6 +418,7 @@ impl App {
             gpu_grade: self.gpu_grade,
             pack_topic: self.pack_topic.clone(),
             pack_format: self.pack_format,
+            recent: self.recent.clone(),
         }
     }
 
@@ -417,6 +457,7 @@ impl App {
             self.gpu_grade = s.gpu_grade;
             self.pack_topic = s.pack_topic;
             self.pack_format = s.pack_format;
+            self.recent = s.recent.into_iter().filter(|r| r.path.is_file()).collect();
             if std::env::var_os("VE_MONTAGE").is_none() && s.montage {
                 self.mode = Mode::Montage;
             }
@@ -492,6 +533,49 @@ impl App {
             let probe = media::probe(&tools, &path);
             mail.send(Msg::Opened(path, probe));
         });
+    }
+
+    fn start_tools_download(&mut self) {
+        if self.tools_download.is_some() {
+            return;
+        }
+        self.tools_download = Some(0.0);
+        let mail = self.mail.clone();
+        std::thread::spawn(move || {
+            let progress = mail.clone();
+            let result = Tools::download(move |p| progress.send(Msg::ToolsProgress(p)));
+            mail.send(Msg::Tools(result));
+        });
+    }
+
+    /// The eight looks as small pictures of the current frame, drawn with the same colour maths as the preview.
+    fn refresh_looks(&mut self, ctx: &egui::Context) {
+        let Some(raw) = &self.raw else { return };
+        // Not while playing: new pictures every frame would cost more than they show.
+        if !self.looks_dirty || self.player.is_some() {
+            return;
+        }
+        let (w, h) = (raw.width.max(1), raw.height.max(1));
+        let tw = 192usize.min(w);
+        let th = (tw * h / w).max(1);
+        let mut small = Vec::with_capacity(tw * th * 3);
+        for y in 0..th {
+            for x in 0..tw {
+                let at = ((y * h / th) * w + x * w / tw) * 3;
+                small.extend_from_slice(&raw.rgb[at..at + 3]);
+            }
+        }
+        let mut textures = Vec::with_capacity(LOOKS.len());
+        for (i, look) in LOOKS.iter().enumerate() {
+            let mut g = self.auto_base;
+            g.strength = self.grade.strength;
+            look.apply(&mut g, self.auto_base.temperature);
+            let lut = Lut::build(17, &g, None);
+            let image = egui::ColorImage::from_rgb([tw, th], &lut.apply(&small));
+            textures.push(ctx.load_texture(format!("look-{i}"), image, egui::TextureOptions::LINEAR));
+        }
+        self.look_tex = textures;
+        self.looks_dirty = false;
     }
 
     fn request_frame(&mut self, t: f64) {
@@ -756,6 +840,14 @@ impl App {
                     }
                 }
                 let message = format!("{}  {}x{}  {}  {:.0} fps", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()), probe.width, probe.height, clock(probe.duration), probe.fps);
+                self.recent.retain(|r| r.path != path);
+                self.recent.insert(0, Recent { path: path.clone(), duration: probe.duration, height: probe.height, fps: probe.fps });
+                self.recent.truncate(6);
+                if self.mode == Mode::Single && self.step == Step::Source {
+                    self.step = Step::Look;
+                }
+                self.activity = None;
+                self.looks_dirty = true;
                 self.source = Some(Source { path, probe });
                 let t = self.t;
                 self.request_frame(t);
@@ -772,6 +864,7 @@ impl App {
                     Ok(frame) if self.player.is_none() => {
                         self.raw = Some(frame);
                         self.raw_changed = true;
+                        self.looks_dirty = true;
                     }
                     Ok(_) => {}
                     Err(e) => self.fail(e),
@@ -782,6 +875,7 @@ impl App {
             }
             Msg::Analysed(Ok(g)) => {
                 self.auto_base = g;
+                self.looks_dirty = true;
                 self.apply_base();
             }
             Msg::Analysed(Err(e)) => self.fail(e),
@@ -930,463 +1024,6 @@ impl App {
         }
         self.raw_changed = false;
     }
-
-    fn preview(&mut self, ui: &mut egui::Ui) {
-        let (Some(before), Some(after)) = (self.before_tex.clone(), self.after_tex.clone()) else { return };
-        let aspect = before.size()[0] as f32 / before.size()[1] as f32;
-        let avail = ui.available_size();
-        let (w, h) = if avail.x / avail.y > aspect { (avail.y * aspect, avail.y) } else { (avail.x, avail.x / aspect) };
-        let (rect, response) = ui.allocate_exact_size(vec2(w.max(10.0), h.max(10.0)), egui::Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        let full = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        let label = |rect: egui::Rect, text: &str, align: egui::Align2| {
-            let anchor = match align {
-                egui::Align2::RIGHT_TOP => rect.right_top() + vec2(-10.0, 10.0),
-                _ => rect.left_top() + vec2(10.0, 10.0),
-            };
-            let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::proportional(13.0), Color32::WHITE);
-            let box_rect = align.anchor_size(anchor, galley.size()).expand2(vec2(6.0, 3.0));
-            painter.rect_filled(box_rect, 4.0, Color32::from_black_alpha(150));
-            painter.galley(box_rect.min + vec2(6.0, 3.0), galley, Color32::WHITE);
-        };
-        match self.compare {
-            Compare::Before => {
-                painter.image(before.id(), rect, full, Color32::WHITE);
-                label(rect, "BEFORE", egui::Align2::LEFT_TOP);
-            }
-            Compare::After => {
-                painter.image(after.id(), rect, full, Color32::WHITE);
-                label(rect, "AFTER", egui::Align2::LEFT_TOP);
-            }
-            Compare::Split | Compare::Side => {
-                if self.compare == Compare::Split {
-                    if let Some(p) = response.interact_pointer_pos().filter(|_| response.dragged() || response.clicked()) {
-                        self.split = ((p.x - rect.left()) / rect.width()).clamp(0.02, 0.98);
-                    }
-                    let x = rect.left() + rect.width() * self.split;
-                    let left = egui::Rect::from_min_max(rect.min, pos2(x, rect.bottom()));
-                    let right = egui::Rect::from_min_max(pos2(x, rect.top()), rect.max);
-                    painter.image(before.id(), left, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(self.split, 1.0)), Color32::WHITE);
-                    painter.image(after.id(), right, egui::Rect::from_min_max(pos2(self.split, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                    painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], egui::Stroke::new(2.0, Color32::WHITE));
-                    painter.circle(pos2(x, rect.center().y), 11.0, Color32::from_rgb(214, 92, 51), egui::Stroke::new(2.0, Color32::WHITE));
-                    label(rect, "BEFORE", egui::Align2::LEFT_TOP);
-                    label(rect, "AFTER", egui::Align2::RIGHT_TOP);
-                } else {
-                    let half = egui::Rect::from_min_max(rect.min, pos2(rect.center().x - 2.0, rect.bottom()));
-                    let other = half.translate(vec2(rect.width() / 2.0 + 2.0, 0.0));
-                    painter.image(before.id(), half, full, Color32::WHITE);
-                    painter.image(after.id(), other, full, Color32::WHITE);
-                    label(half, "BEFORE", egui::Align2::LEFT_TOP);
-                    label(other, "AFTER", egui::Align2::LEFT_TOP);
-                }
-            }
-        }
-        if let (true, Some(source)) = (self.show_guide && self.wants_vertical, &self.source) {
-            let share = source.probe.vertical_share() as f32;
-            if share < 1.0 && self.framing != VerticalFraming::Blur {
-                let pos = match self.framing {
-                    VerticalFraming::Manual => self.manual_x,
-                    VerticalFraming::Follow => self.action.as_ref().map_or(0.5, |p| media::action_at(p, self.t)),
-                    _ => 0.5,
-                };
-                let width = rect.width() * share;
-                let left = rect.left() + (rect.width() - width) * pos;
-                let dim = Color32::from_black_alpha(140);
-                painter.rect_filled(egui::Rect::from_min_max(rect.min, pos2(left, rect.bottom())), 0.0, dim);
-                painter.rect_filled(egui::Rect::from_min_max(pos2(left + width, rect.top()), rect.max), 0.0, dim);
-                painter.rect_stroke(egui::Rect::from_min_max(pos2(left, rect.top()), pos2(left + width, rect.bottom())), 0.0, egui::Stroke::new(2.0, Color32::from_rgb(240, 140, 100)), egui::StrokeKind::Inside);
-            }
-        }
-    }
-
-    fn slider(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, name: &str) -> bool {
-        ui.add(egui::Slider::new(value, range).text(name).fixed_decimals(2)).changed()
-    }
-
-    fn controls(&mut self, ui: &mut egui::Ui) {
-        if self.tools.is_none() {
-            ui.group(|ui| {
-                ui.label(RichText::new("Video tools needed").strong());
-                ui.label("This app uses FFmpeg to read and write video. Download it once (about 110 MB, checked for safety before use).");
-                if let Some(p) = self.tools_download {
-                    ui.add(egui::ProgressBar::new(p).show_percentage());
-                } else if ui.button("Download video tools").clicked() {
-                    self.tools_download = Some(0.0);
-                    let mail = self.mail.clone();
-                    std::thread::spawn(move || {
-                        let progress = mail.clone();
-                        let result = Tools::download(move |p| progress.send(Msg::ToolsProgress(p)));
-                        mail.send(Msg::Tools(result));
-                    });
-                }
-            });
-            ui.add_space(6.0);
-        }
-
-        ui.heading("Look");
-        ui.label(RichText::new("Pick a starting point. Auto-fix has already corrected exposure and white balance.").weak().small());
-        let mut picked = None;
-        ui.horizontal_wrapped(|ui| {
-            for (i, look) in LOOKS.iter().enumerate() {
-                if ui.selectable_label(self.look == Some(i), look.name).on_hover_text(look.note).clicked() {
-                    picked = Some(i);
-                }
-            }
-        });
-        if let Some(i) = picked {
-            self.pick_look(i);
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Auto-fix again").on_hover_text("Re-measures the brightness and colour cast of the selected part of the video").clicked() {
-                self.analyse();
-            }
-            if ui.button("Reset").clicked() {
-                self.look = None;
-                self.learned = None;
-                self.grade = Grade::default();
-            }
-        });
-        Self::slider(ui, &mut self.grade.strength, 0.0..=1.0, "Overall amount");
-        if let Some(learned) = &mut self.learned {
-            ui.add(egui::Slider::new(&mut learned.amount, 0.0..=1.0).text("Omni look amount").fixed_decimals(2));
-        }
-
-        ui.add_space(4.0);
-        egui::CollapsingHeader::new("Fine tune").default_open(false).show(ui, |ui| {
-            let g = &mut self.grade;
-            let mut touched = false;
-            touched |= Self::slider(ui, &mut g.exposure, -1.0..=1.0, "Exposure");
-            touched |= Self::slider(ui, &mut g.contrast, -0.5..=0.6, "Contrast");
-            touched |= Self::slider(ui, &mut g.highlights, -1.0..=1.0, "Highlights");
-            touched |= Self::slider(ui, &mut g.shadows, -1.0..=1.0, "Shadows");
-            touched |= Self::slider(ui, &mut g.temperature, -1.0..=1.0, "Warmth");
-            touched |= Self::slider(ui, &mut g.tint, -1.0..=1.0, "Tint");
-            touched |= Self::slider(ui, &mut g.saturation, -0.6..=0.6, "Saturation");
-            touched |= Self::slider(ui, &mut g.vibrance, 0.0..=0.8, "Vibrance");
-            touched |= Self::slider(ui, &mut g.teal_orange, 0.0..=1.0, "Teal & orange");
-            touched |= Self::slider(ui, &mut g.fade, 0.0..=0.2, "Fade");
-            if touched {
-                self.look = None;
-            }
-        });
-        egui::CollapsingHeader::new("Finishing (applied when you export)").default_open(false).show(ui, |ui| {
-            Self::slider(ui, &mut self.finish.sharpen, 0.0..=1.0, "Sharpen (slower export)");
-            Self::slider(ui, &mut self.finish.denoise, 0.0..=1.0, "Noise cleanup");
-            ui.checkbox(&mut self.finish.loudness, "Even out the sound (YouTube level)");
-        });
-
-        ui.add_space(8.0);
-        ui.heading("AI helpers");
-        ui.label(RichText::new("Optional. They need your own API key.").weak().small());
-        ui.label("Style you want");
-        ui.add(egui::TextEdit::multiline(&mut self.style_notes).desired_rows(2).desired_width(f32::INFINITY));
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.reuse_ai, "Reuse saved AI answers").on_hover_text("When nothing has changed, a saved answer is shown instead of asking the AI again. No cost, no tokens.");
-            if ui.small_button("Forget saved answers").clicked() {
-                let n = store::clear_ai_cache();
-                self.note(format!("Forgot {n} saved AI answer(s). The next request will ask the AI again."));
-            }
-        });
-        let busy = self.ai_busy.is_some();
-        let have_video = self.source.is_some();
-        ui.add_enabled_ui(!busy, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(self.has_gemini && have_video, |ui| {
-                    if ui.button("Grade with Gemini Omni").on_hover_text("Omni grades a 10-second sample from across your video. The app copies that look onto the real footage. Costs money.").clicked() {
-                        self.confirm_omni = true;
-                    }
-                });
-            });
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("openai_model").selected_text(ai::OPENAI_MODELS[self.openai_model].1).show_ui(ui, |ui| {
-                    for (i, (_, name)) in ai::OPENAI_MODELS.iter().enumerate() {
-                        ui.selectable_value(&mut self.openai_model, i, *name);
-                    }
-                });
-                ui.add_enabled_ui(self.has_openai, |ui| {
-                    if ui.button("Suggest with OpenAI").on_hover_text("Sends 6 small pictures from your video and applies the slider values it suggests.").clicked() {
-                        self.run_openai();
-                    }
-                });
-            });
-        });
-        if let Some(text) = &self.ai_busy {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(text);
-            });
-        }
-        if !self.ai_result.is_empty() {
-            ui.label(RichText::new(&self.ai_result).italics());
-        }
-        egui::CollapsingHeader::new(if self.has_gemini || self.has_openai { "API keys (saved)" } else { "API keys" }).show(ui, |ui| {
-            ui.label(RichText::new("Stored in your computer's secure credential store, not in a file.").weak().small());
-            for (provider, name, buffer, flag) in [
-                (ai::Provider::Gemini, "Gemini", &mut self.gemini_key, &mut self.has_gemini),
-                (ai::Provider::OpenAi, "OpenAI", &mut self.openai_key, &mut self.has_openai),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(buffer).password(true).hint_text(format!("{name} key")).desired_width(150.0));
-                    if ui.button("Save").clicked() {
-                        match ai::save_key(provider, buffer) {
-                            Ok(()) => {
-                                buffer.clear();
-                                *flag = ai::load_key(provider).is_some();
-                            }
-                            Err(e) => {
-                                self.status = e;
-                                self.status_is_error = true;
-                            }
-                        }
-                    }
-                    if *flag && ui.small_button("Remove").clicked() {
-                        let _ = ai::save_key(provider, "");
-                        *flag = ai::load_key(provider).is_some();
-                    }
-                });
-            }
-        });
-    }
-
-    /// Zoom and position of the main picture over the blurred background, with a
-    /// live 9:16 preview. Drag the preview to move the picture.
-    fn blur_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Main picture").weak().small());
-        ui.add(egui::Slider::new(&mut self.blur.zoom, 1.0..=2.0).text("zoom").fixed_decimals(2));
-        let Some(tex) = self.after_tex.clone() else { return };
-        let aspect = tex.size()[0] as f32 / tex.size()[1].max(1) as f32;
-        let width = 150.0f32.min(ui.available_width());
-        let (rect, response) = ui.allocate_exact_size(vec2(width, width * 16.0 / 9.0), egui::Sense::click_and_drag());
-        let b = &mut self.blur;
-        let (fw, fh) = (rect.width() * b.zoom, rect.width() * b.zoom / aspect);
-        if response.dragged() {
-            // Dragging the picture one way shows more of the other side of it.
-            let d = response.drag_delta();
-            if fw > rect.width() + 0.5 {
-                b.x = (b.x - d.x / (fw - rect.width())).clamp(0.0, 1.0);
-            }
-            if fh < rect.height() - 0.5 {
-                b.y = (b.y + d.y / (rect.height() - fh)).clamp(0.0, 1.0);
-            }
-        }
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 4.0, Color32::BLACK);
-        // The background is the same picture filling the frame, dimmed like the blur.
-        let cover = ((9.0 / 16.0) / aspect).min(1.0);
-        let uv = egui::Rect::from_min_max(pos2(0.5 - cover / 2.0, 0.0), pos2(0.5 + cover / 2.0, 1.0));
-        painter.image(tex.id(), rect, uv, Color32::from_gray(80));
-        let left = rect.left() - (fw - rect.width()) * b.x;
-        let top = if fh > rect.height() { rect.top() - (fh - rect.height()) * 0.5 } else { rect.top() + (rect.height() - fh) * b.y };
-        let picture = egui::Rect::from_min_size(pos2(left, top), vec2(fw, fh));
-        painter.image(tex.id(), picture, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-        // A crosshair on the middle of the main picture.
-        let centre = picture.intersect(rect).center();
-        for colour_width in [(Color32::BLACK, 3.0), (Color32::WHITE, 1.2)] {
-            let stroke = egui::Stroke::new(colour_width.1, colour_width.0);
-            painter.line_segment([centre - vec2(9.0, 0.0), centre + vec2(9.0, 0.0)], stroke);
-            painter.line_segment([centre - vec2(0.0, 9.0), centre + vec2(0.0, 9.0)], stroke);
-        }
-        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Color32::from_gray(120)), egui::StrokeKind::Inside);
-        ui.horizontal(|ui| {
-            if ui.small_button("Centre").on_hover_text("Put the picture back in the middle").clicked() {
-                self.blur.x = 0.5;
-                self.blur.y = 0.5;
-            }
-            if ui.small_button("Reset zoom").clicked() {
-                self.blur = BlurLayout::default();
-            }
-        });
-        ui.label(RichText::new("Drag the preview to move the picture.").weak().small());
-    }
-
-    /// Which encoder writes the finished video. Shared by both screens.
-    pub fn encoder_picker(&mut self, ui: &mut egui::Ui, show_grade: bool) {
-        let using = self.encoder_choice.resolve(&self.encoders);
-        let automatic = format!("Automatic ({})", using.short());
-        ui.horizontal(|ui| {
-            ui.label("Encoder");
-            let shown = match self.encoder_choice {
-                EncoderChoice::Auto => automatic.clone(),
-                _ => using.name().to_string(),
-            };
-            egui::ComboBox::from_id_salt("encoder").selected_text(shown).width(200.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.encoder_choice, EncoderChoice::Auto, automatic);
-                ui.selectable_value(&mut self.encoder_choice, EncoderChoice::Cpu, Encoder::Cpu.name());
-                for (choice, encoder) in [(EncoderChoice::Nvidia, Encoder::Nvidia), (EncoderChoice::Amd, Encoder::Amd), (EncoderChoice::Intel, Encoder::Intel)] {
-                    if self.encoders.contains(&encoder) {
-                        ui.selectable_value(&mut self.encoder_choice, choice, encoder.name());
-                    }
-                }
-            });
-        });
-        ui.label(RichText::new(if self.encoders.is_empty() { "No graphics-card encoder found here, so the CPU is used." } else { "Graphics-card encoding is much faster. Files come out slightly larger." }).weak().small());
-        if show_grade {
-            let ready = matches!(self.gpu_status, Some(Ok(_)));
-            ui.add_enabled(ready, egui::Checkbox::new(&mut self.gpu_grade, "Grade colour on the graphics card"))
-                .on_hover_text("Much faster than the processor, and identical to the preview. Single-video exports only for now; montages still grade with FFmpeg.");
-            let status = match &self.gpu_status {
-                None => "Checking the graphics card…".to_string(),
-                Some(Ok(name)) => format!("Colour grading on: {name}"),
-                Some(Err(why)) => format!("Not available here, so FFmpeg grades the colour: {why}"),
-            };
-            ui.label(RichText::new(status).weak().small());
-        }
-    }
-
-    fn export_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Export");
-        let have = self.source.is_some();
-        if !have {
-            ui.label(RichText::new("Open a video to export it.").weak());
-        }
-        ui.add_enabled_ui(have && self.export.is_none(), |ui| {
-            ui.checkbox(&mut self.wants_wide, "16:9 video (YouTube)");
-            if self.wants_wide {
-                ui.indent("wide", |ui| {
-                    egui::ComboBox::from_id_salt("wide_height").selected_text(match self.wide_height {
-                        0 => "Same size as the original".to_string(),
-                        h => format!("{h}p"),
-                    }).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.wide_height, 0, "Same size as the original");
-                        ui.selectable_value(&mut self.wide_height, 1080, "1080p");
-                        ui.selectable_value(&mut self.wide_height, 1440, "1440p");
-                        ui.selectable_value(&mut self.wide_height, 2160, "2160p (4K)");
-                    });
-                });
-            }
-            ui.checkbox(&mut self.wants_vertical, "9:16 video (Shorts, Reels, TikTok)");
-            if self.wants_vertical {
-                ui.indent("vertical", |ui| {
-                    let mut follow_wanted = false;
-                    ui.radio_value(&mut self.framing, VerticalFraming::Follow, "Follow the action").on_hover_text("A calm virtual camera that pans toward movement and detail");
-                    ui.radio_value(&mut self.framing, VerticalFraming::Centre, "Centre");
-                    ui.radio_value(&mut self.framing, VerticalFraming::Manual, "I'll choose where");
-                    ui.radio_value(&mut self.framing, VerticalFraming::Blur, "Whole picture on a blurred background");
-                    if self.framing == VerticalFraming::Manual {
-                        ui.add(egui::Slider::new(&mut self.manual_x, 0.0..=1.0).text("left to right").show_value(false));
-                    }
-                    if self.framing == VerticalFraming::Blur {
-                        self.blur_controls(ui);
-                    }
-                    if self.framing == VerticalFraming::Follow {
-                        if self.action_busy {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Finding the action…");
-                            });
-                        } else if self.action.is_none() {
-                            follow_wanted = ui.button("Find the action now").clicked();
-                        } else {
-                            ui.label(RichText::new("Action found. The box in the preview shows the crop.").weak().small());
-                        }
-                    }
-                    ui.checkbox(&mut self.show_guide, "Show the 9:16 box in the preview");
-                    if follow_wanted {
-                        self.follow_action();
-                    }
-                });
-            }
-            ui.checkbox(&mut self.wants_thumb, "Thumbnail picture (current frame)");
-            ui.checkbox(&mut self.wants_lut, "Colour file (.cube) for other editors");
-        });
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Save to");
-            let shown = self.out_dir.clone().or_else(|| self.source.as_ref().and_then(|s| s.path.parent().map(PathBuf::from)));
-            ui.label(RichText::new(shown.map_or_else(|| "next to the video".to_string(), |d| d.display().to_string())).small());
-        });
-        if ui.button("Choose folder…").clicked()
-            && let Some(dir) = rfd::FileDialog::new().pick_folder()
-        {
-            self.out_dir = Some(dir);
-        }
-        ui.add_space(4.0);
-        self.encoder_picker(ui, true);
-        ui.add_space(6.0);
-        if let Some(state) = &self.export {
-            ui.label(&state.label);
-            ui.add(egui::ProgressBar::new(state.progress).show_percentage());
-            if ui.button("Cancel").clicked() {
-                state.cancel.store(true, Ordering::Relaxed);
-            }
-        } else if ui.add_enabled(have, egui::Button::new(RichText::new("Export").strong().size(16.0)).fill(Color32::from_rgb(214, 92, 51)).min_size(vec2(ui.available_width(), 34.0))).clicked() {
-            self.start_export();
-        }
-        if !self.made.is_empty() {
-            ui.add_space(6.0);
-            ui.label(RichText::new("Made:").strong());
-            for file in &self.made {
-                ui.label(RichText::new(file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())).small());
-            }
-            if ui.button("Show in folder").clicked()
-                && let Some(parent) = self.made[0].parent()
-            {
-                #[cfg(windows)]
-                let program = "explorer";
-                #[cfg(target_os = "macos")]
-                let program = "open";
-                #[cfg(all(not(windows), not(target_os = "macos")))]
-                let program = "xdg-open";
-                let _ = std::process::Command::new(program).arg(parent).spawn();
-            }
-        }
-
-        ui.add_space(8.0);
-        egui::CollapsingHeader::new("Upload pack (titles, description, thumbnail)").default_open(self.pack1.pack.is_some()).show(ui, |ui| self.pack_ui(ui, pack_ui::Target::Single));
-
-        if let Some(scope) = &self.scope {
-            ui.add_space(10.0);
-            ui.label(RichText::new("Colour levels after grading").weak().small());
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 70.0), egui::Sense::hover());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 4.0, Color32::from_gray(18));
-            for (ch, colour) in [Color32::from_rgb(235, 70, 70), Color32::from_rgb(70, 200, 90), Color32::from_rgb(80, 130, 255)].into_iter().enumerate() {
-                let points: Vec<_> = scope[ch].iter().enumerate().map(|(i, v)| pos2(rect.left() + rect.width() * i as f32 / 63.0, rect.bottom() - 3.0 - (rect.height() - 8.0) * v)).collect();
-                painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, colour.gamma_multiply(0.85))));
-            }
-        }
-    }
-
-    fn timeline(&mut self, ui: &mut egui::Ui) {
-        let Some(duration) = self.source.as_ref().map(|s| s.probe.duration) else {
-            ui.label(RichText::new("Sample picture. Open a video to scrub and play.").weak());
-            return;
-        };
-        ui.horizontal(|ui| {
-            let playing = self.player.is_some();
-            if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
-                self.toggle_play();
-            }
-            ui.label(format!("{} / {}", clock(self.t), clock(duration)));
-            ui.label("  ");
-            if ui.small_button("Start here").on_hover_text("Export begins at this moment").clicked() {
-                self.trim.0 = self.t.min(self.trim.1 - 0.5).max(0.0);
-            }
-            if ui.small_button("End here").on_hover_text("Export ends at this moment").clicked() {
-                self.trim.1 = self.t.max(self.trim.0 + 0.5).min(duration);
-            }
-            if ui.small_button("Whole video").clicked() {
-                self.trim = (0.0, duration);
-            }
-            ui.label(RichText::new(format!("Exporting {} to {}", clock(self.trim.0), clock(self.trim.1))).weak());
-        });
-        let width = ui.available_width();
-        ui.spacing_mut().slider_width = width - 20.0;
-        let mut t = self.t;
-        let response = ui.add(egui::Slider::new(&mut t, 0.0..=duration).show_value(false));
-        // The selected part is drawn as an orange bar under the slider.
-        let bar = ui.allocate_exact_size(vec2(width - 20.0, 4.0), egui::Sense::hover()).0;
-        ui.painter().rect_filled(bar, 2.0, Color32::from_gray(50));
-        let at = |s: f64| bar.left() + bar.width() * (s / duration.max(0.01)) as f32;
-        ui.painter().rect_filled(egui::Rect::from_min_max(pos2(at(self.trim.0), bar.top()), pos2(at(self.trim.1), bar.bottom())), 2.0, Color32::from_rgb(214, 92, 51));
-        if response.changed() {
-            self.player = None;
-            self.t = t;
-            self.request_frame(t);
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -1398,6 +1035,10 @@ impl eframe::App for App {
             if !dropped.is_empty() {
                 self.add_clips(dropped);
             }
+        } else if dropped.len() > 1 {
+            // Several clips at once can only mean a montage.
+            self.switch_mode(Mode::Montage);
+            self.add_clips(dropped);
         } else if let Some(path) = dropped.into_iter().next() {
             self.open(path);
         }
@@ -1405,60 +1046,36 @@ impl eframe::App for App {
             self.toggle_play();
         }
         self.refresh(&ctx);
+        self.refresh_looks(&ctx);
         self.autosave(ctx.input(|i| i.time));
 
-        egui::Panel::top("bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Video Enhancer").strong().size(18.0));
-                ui.separator();
-                for (mode, name) in [(Mode::Single, "Single video"), (Mode::Montage, "Montage")] {
-                    if ui.selectable_value(&mut self.mode, mode, name).clicked() {
-                        self.player = None;
-                        self.status_is_error = false;
-                        self.status = match mode {
-                            Mode::Montage => "Add several clips (or drop them here), choose your options, then press Plan with AI.".into(),
-                            Mode::Single => "Drop a video here, or press Open video.".into(),
-                        };
-                    }
-                }
-                if self.mode == Mode::Single {
-                    ui.separator();
-                    if ui.button("Open video…").clicked()
-                        && let Some(path) = rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v", "mts", "wmv"]).pick_file()
-                    {
-                        self.open(path);
-                    }
-                    if self.source.is_some() && ui.button("Use sample picture").clicked() {
-                        self.source = None;
-                        self.video_fp = None;
-                        self.player = None;
-                        self.use_sample();
-                    }
-                    ui.separator();
-                    for (mode, name) in [(Compare::Split, "Slide"), (Compare::Side, "Side by side"), (Compare::Before, "Before"), (Compare::After, "After")] {
-                        ui.selectable_value(&mut self.compare, mode, name);
-                    }
-                }
-            });
-        });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            let colour = if self.status_is_error { Color32::from_rgb(255, 120, 110) } else { ui.visuals().text_color() };
-            ui.label(RichText::new(&self.status).color(colour));
-        });
-        if self.mode == Mode::Montage {
-            egui::CentralPanel::default().show(ui, |ui| self.montage_screen(ui));
-        } else {
-            egui::Panel::bottom("timeline").show(ui, |ui| self.timeline(ui));
-            egui::Panel::left("controls").default_size(330.0).min_size(280.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
-            });
-            egui::Panel::right("export").default_size(250.0).min_size(220.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.export_panel(ui));
-            });
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.centered_and_justified(|ui| self.preview(ui));
-            });
+        self.shell(ui);
+        match (self.mode, self.step) {
+            (Mode::Single, Step::Source) if self.source.is_none() => {
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WINDOW)).show(ui, |ui| self.start_screen(ui));
+            }
+            (Mode::Single, Step::Source) => {
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WINDOW)).show(ui, |ui| self.source_screen(ui));
+            }
+            (Mode::Single, Step::Look) => {
+                self.timeline_panel(ui);
+                self.look_inspector(ui);
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WINDOW)).show(ui, |ui| self.look_center(ui));
+            }
+            (Mode::Single, Step::Export) => {
+                self.export_inspector(ui);
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WINDOW)).show(ui, |ui| self.export_center(ui));
+            }
+            (Mode::Single, Step::Publish) | (Mode::Montage, Step::Publish) => {
+                let target = if self.mode == Mode::Single { pack_ui::Target::Single } else { pack_ui::Target::Montage };
+                self.publish_screen(ui, target);
+            }
+            (Mode::Montage, step) => {
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WINDOW)).show(ui, |ui| self.montage_screen(ui, step));
+            }
         }
+        self.toast(&ctx);
+        self.settings_window(&ctx);
 
         if self.confirm_omni {
             egui::Window::new("Send a sample to Gemini Omni?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| {
@@ -1493,7 +1110,7 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
-        if self.player.is_some() || self.ai_busy.is_some() || self.export.is_some() || self.mon.working() || self.pack1.working() {
+        if self.player.is_some() || self.ai_busy.is_some() || self.export.is_some() || self.mon.working() || self.pack1.working() || self.tools_download.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

@@ -32,6 +32,7 @@ pub struct Track {
 }
 
 impl Track {
+    #[allow(dead_code)]
     pub fn label(&self) -> String {
         format!("{} by {}  ({}, {}:{:02.0})", self.title, self.creator, self.license_name(), (self.seconds / 60.0) as u32, self.seconds % 60.0)
     }

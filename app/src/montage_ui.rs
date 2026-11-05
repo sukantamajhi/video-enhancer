@@ -1,24 +1,28 @@
 //! The Montage screen: add clips, let the AI plan, review the cut list, pick
 //! music, then render 16:9 and 9:16 versions.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use eframe::egui::{self, Color32, RichText, vec2};
+use eframe::egui::{self, Align, Color32, Frame, Layout, Margin, Rect, RichText, Sense, Stroke, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::grade::{Grade, LOOKS, LUT_SIZE, Lut};
 use crate::media::{self, BlurLayout, Probe};
 use crate::montage::{self, Clip, Cut, Job, Music, Out, Sound, Style, Vertical};
 use crate::music::{self, Track};
-use crate::pack_ui::{self, MontageFacts, PackState};
-use crate::{App, Msg, ai, store};
+use crate::pack_ui::{MontageFacts, PackState};
+use crate::theme::{self, Icon, Kind};
+use crate::{App, Msg, Step, ai, store};
 
 const MAX_CLIPS: usize = 12;
 
 pub enum Event {
     Probed(PathBuf, Result<Probe, String>),
+    /// A small picture of a clip, for its card.
+    Thumb(PathBuf, media::Frame),
     /// The clips of the last session, probed again. The number is how many were saved.
     Restored(Vec<Clip>, usize),
     Note(String),
@@ -105,6 +109,7 @@ pub struct State {
     pack: PackState,
     rendered: Vec<Cut>,
     credit: String,
+    thumbs: HashMap<PathBuf, egui::TextureHandle>,
 }
 
 impl State {
@@ -136,6 +141,7 @@ impl State {
             pack: PackState::default(),
             rendered: Vec::new(),
             credit: String::new(),
+            thumbs: HashMap::new(),
         }
     }
 
@@ -191,6 +197,39 @@ impl State {
         (!cuts.is_empty() && !self.clips.is_empty()).then(|| MontageFacts { clips: self.clips.clone(), cuts, grades: plan.grades.clone(), style: self.style, title: self.title.clone(), credit: self.credit.clone(), out_dir: self.out_dir.clone(), rendered })
     }
 
+    pub fn summary_line(&self) -> String {
+        if self.clips.is_empty() { "no clips yet".into() } else { format!("{} clips · {}", self.clips.len(), clock(self.total())) }
+    }
+
+    pub fn has_clips(&self) -> bool {
+        !self.clips.is_empty()
+    }
+
+    pub fn has_plan(&self) -> bool {
+        self.plan.is_some()
+    }
+
+    pub fn has_made(&self) -> bool {
+        !self.made.is_empty()
+    }
+
+    pub fn has_pack(&self) -> bool {
+        self.pack.pack.is_some()
+    }
+
+    /// Progress, what is happening, and how to stop it, while a montage is rendering.
+    pub fn render_info(&self) -> Option<(f32, String, Arc<AtomicBool>)> {
+        self.render.as_ref().map(|(p, label, cancel)| (*p, label.clone(), cancel.clone()))
+    }
+
+    pub fn busy_text(&self) -> Option<String> {
+        self.busy.clone().or_else(|| self.searching.then(|| "Searching for free music…".to_string()))
+    }
+
+    pub fn pack_busy(&self) -> Option<String> {
+        self.pack.busy.clone()
+    }
+
     fn total(&self) -> f64 {
         self.clips.iter().map(|c| c.probe.duration).sum()
     }
@@ -233,7 +272,11 @@ impl App {
             let (tools, mail) = (tools.clone(), self.mail.clone());
             std::thread::spawn(move || {
                 let probe = media::probe(&tools, &path);
-                mail.send(Msg::Montage(Event::Probed(path, probe)));
+                let picture = probe.as_ref().ok().and_then(|p| grab_thumb(&tools, p, &path));
+                mail.send(Msg::Montage(Event::Probed(path.clone(), probe)));
+                if let Some(frame) = picture {
+                    mail.send(Msg::Montage(Event::Thumb(path, frame)));
+                }
             });
         }
     }
@@ -269,6 +312,11 @@ impl App {
                     Ok(_) => self.fail(format!("{} is shorter than 2 seconds.", path.display())),
                     Err(e) => self.fail(format!("{}: {e}", path.display())),
                 }
+            }
+            Event::Thumb(path, frame) => {
+                let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
+                let tex = self.mail.ctx.load_texture(format!("clip-{}", path.display()), image, egui::TextureOptions::LINEAR);
+                self.mon.thumbs.insert(path, tex);
             }
             Event::Note(text) => self.note(text),
             Event::Plan(Ok(plan)) => {
@@ -347,7 +395,11 @@ impl App {
         std::thread::spawn(move || {
             // Keep the original order, and drop any file that is no longer there.
             let clips: Vec<Clip> = saved.clips.into_iter().filter_map(|path| media::probe(&tools, &path).ok().map(|probe| Clip { path, probe })).collect();
+            let pictures: Vec<(PathBuf, media::Frame)> = clips.iter().filter_map(|c| grab_thumb(&tools, &c.probe, &c.path).map(|f| (c.path.clone(), f))).collect();
             mail.send(Msg::Montage(Event::Restored(clips, expected)));
+            for (path, frame) in pictures {
+                mail.send(Msg::Montage(Event::Thumb(path, frame)));
+            }
         });
     }
 
@@ -541,163 +593,290 @@ impl App {
         });
     }
 
-    pub fn montage_screen(&mut self, ui: &mut egui::Ui) {
-        // VE_SCROLL=900 starts the page scrolled down, for screenshots of the lower sections.
-        let mut area = egui::ScrollArea::vertical();
-        if let Some(y) = std::env::var("VE_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
-            area = area.vertical_scroll_offset(y);
-        }
-        area.show(ui, |ui| {
-            ui.set_max_width(980.0);
-            ui.heading("Montage");
-            ui.label(RichText::new("Drop several clips here. The AI picks the best moments, and your real footage is cut together.").weak());
-            ui.add_space(6.0);
-            self.clips_section(ui);
-            ui.add_space(8.0);
-            self.settings_section(ui);
-            ui.add_space(8.0);
-            self.plan_section(ui);
-            ui.add_space(8.0);
-            self.make_section(ui);
+    pub fn montage_screen(&mut self, ui: &mut egui::Ui, step: Step) {
+        self.montage_summary(ui, step);
+        egui::CentralPanel::default().frame(Frame::new().fill(theme::WINDOW)).show(ui, |ui| {
+            // VE_SCROLL=900 starts the page scrolled down, for screenshots of the lower sections.
+            let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if let Some(y) = std::env::var("VE_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
+                area = area.vertical_scroll_offset(y);
+            }
+            area.show(ui, |ui| {
+                Frame::new().inner_margin(Margin { left: 28, right: 28, top: 16, bottom: 28 }).show(ui, |ui| match step {
+                    Step::Source => self.clips_step(ui),
+                    Step::Look => self.plan_step(ui),
+                    _ => self.make_step(ui),
+                });
+            });
         });
     }
 
-    fn clips_section(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("1. Clips").strong().size(16.0));
-            if ui.button("Add clips…").clicked()
-                && let Some(paths) = rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v", "mts", "wmv"]).pick_files()
-            {
-                self.add_clips(paths);
-            }
-            if self.mon.probing > 0 {
-                ui.spinner();
-            }
-            if !self.mon.clips.is_empty() {
-                ui.label(RichText::new(format!("{} clips, {} in total", self.mon.clips.len(), clock(self.mon.total()))).weak());
-            }
-        });
-        let mut action: Option<(usize, i32)> = None;
-        for (i, clip) in self.mon.clips.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!("{}.", i + 1));
-                ui.label(RichText::new(clip.name()).strong());
-                ui.label(RichText::new(format!("{}  {}x{}", clock(clip.probe.duration), clip.probe.width, clip.probe.height)).weak());
-                if i > 0 && ui.small_button("Up").clicked() {
-                    action = Some((i, -1));
-                }
-                if i + 1 < self.mon.clips.len() && ui.small_button("Down").clicked() {
-                    action = Some((i, 1));
-                }
-                if ui.small_button("Remove").clicked() {
-                    action = Some((i, 0));
+    // ------------------------------------------------------------------ summary
+
+    fn montage_summary(&mut self, ui: &mut egui::Ui, step: Step) {
+        let mut plan = false;
+        let mut make = false;
+        let mut publish = false;
+        egui::Panel::right("montage-summary").exact_size(372.0).frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(20, 0))).show(ui, |ui| {
+            egui::Panel::bottom("montage-footer").exact_size(if self.mon.made.is_empty() { 84.0 } else { 140.0 }).frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(0, 16))).show_separator_line(true).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+                let m = &self.mon;
+                let working = m.busy.is_some() || m.render.is_some();
+                let width = ui.available_width();
+                if m.plan.is_none() {
+                    ui.add_enabled_ui(!m.clips.is_empty() && self.has_openai && !working, |ui| {
+                        plan = theme::button(ui, if m.busy.is_some() { "Planning…" } else { "Plan with AI" }, Kind::Primary, width).clicked();
+                    });
+                } else {
+                    ui.add_enabled_ui(!working, |ui| {
+                        make = theme::button(ui, if m.render.is_some() { "Making the montage…" } else if m.made.is_empty() { "Make the montage" } else { "Make it again" }, if m.made.is_empty() { Kind::Primary } else { Kind::Secondary }, width).clicked();
+                    });
+                    if !m.made.is_empty() {
+                        publish = theme::button_with_icon(ui, "Continue to Publish", Some(Icon::ArrowRight), Kind::Primary, width).clicked();
+                    }
                 }
             });
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(16.0);
+                ui.label(theme::bold("Your montage", 15.0));
+                let m = &self.mon;
+                theme::card(ui, |ui| {
+                    summary_row(ui, "Clips", &if m.clips.is_empty() { "none yet".to_string() } else { format!("{} · {}", m.clips.len(), clock(m.total())) });
+                    summary_row(ui, "Style", m.style.name());
+                    summary_row(ui, "Length", &format!("about {}", clock(m.target)));
+                    summary_row(ui, "Sound", m.sound.name());
+                    if m.sound.uses_music() {
+                        let music = match (m.source, m.tracks.get(m.track), &m.file) {
+                            (MusicSource::File, _, Some(f)) => f.file_name().map_or_else(|| "your file".to_string(), |n| n.to_string_lossy().into_owned()),
+                            (MusicSource::File, _, None) => "no file chosen".to_string(),
+                            (MusicSource::Online, Some(t), _) => t.title.clone(),
+                            (MusicSource::Online, None, _) => "found after planning".to_string(),
+                        };
+                        summary_row(ui, "Music", &music);
+                    }
+                    summary_row(ui, "Look", m.look.map_or("Natural (fix only)", |i| LOOKS[i].name));
+                    let shapes = match (m.make_wide, m.make_vertical) {
+                        (true, true) => "16:9 and 9:16",
+                        (true, false) => "16:9",
+                        (false, true) => "9:16",
+                        (false, false) => "nothing ticked",
+                    };
+                    summary_row(ui, "Makes", shapes);
+                    if let Some(p) = &m.plan {
+                        let kept = m.keep.iter().filter(|k| **k).count();
+                        summary_row(ui, "Moments", &format!("{kept} of {} kept", p.cuts.len()));
+                    }
+                });
+                match (step, self.mon.plan.is_some()) {
+                    (Step::Source, false) => {
+                        ui.label(theme::muted("Next, the AI looks at small pictures from each clip and picks the best moments. Your video files are not uploaded."));
+                    }
+                    (_, true) if self.mon.made.is_empty() => {
+                        ui.label(theme::muted("Untick any moment you don't want, then make the montage."));
+                    }
+                    _ => {}
+                }
+                if !self.has_openai && self.mon.plan.is_none() {
+                    theme::card_with(ui, theme::tint(theme::WARN, 18), theme::tint(theme::WARN, 70), |ui| {
+                        ui.label(theme::bold("OpenAI key needed", 13.5));
+                        ui.label(theme::soft("Planning uses your own OpenAI key."));
+                        if theme::small_button(ui, "Add it in Settings").clicked() {
+                            self.show_settings = true;
+                        }
+                    });
+                }
+                if !self.mon.made.is_empty() {
+                    theme::card_with(ui, theme::tint(theme::OK, 18), theme::tint(theme::OK, 70), |ui| {
+                        ui.label(theme::bold("Saved", 14.0));
+                        for file in &self.mon.made {
+                            ui.label(RichText::new(file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())).size(12.5).color(theme::TEXT2));
+                        }
+                        if theme::small_button(ui, "Show in folder").clicked()
+                            && let Some(parent) = self.mon.made[0].parent()
+                        {
+                            crate::screens::show_in_folder(parent);
+                        }
+                    });
+                }
+                ui.add_space(16.0);
+            });
+        });
+        if plan {
+            self.step = Step::Look;
+            self.plan_montage();
+        }
+        if make {
+            self.step = Step::Export;
+            self.render_montage();
+        }
+        if publish {
+            self.step = Step::Publish;
+        }
+    }
+
+    // ------------------------------------------------------------------- clips
+
+    fn clips_step(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(theme::bold("Clips", 18.0));
+            ui.label(theme::soft("Drop several clips anywhere in this window. The order is the order they play in."));
+        });
+        ui.add_space(6.0);
+        let mut action: Option<(usize, i32)> = None;
+        let mut add = false;
+        let gap = 14.0;
+        let width = ((ui.available_width() - gap * 2.0) / 3.0).floor();
+        let count = self.mon.clips.len();
+        let tiles = count + 1;
+        for row in 0..tiles.div_ceil(3) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for col in 0..3 {
+                    let i = row * 3 + col;
+                    if i < count {
+                        let (name, probe_text, duration) = {
+                            let c = &self.mon.clips[i];
+                            (c.name(), format!("{}×{}", c.probe.width, c.probe.height), c.probe.duration)
+                        };
+                        let thumb = self.mon.thumbs.get(&self.mon.clips[i].path).cloned();
+                        ui.allocate_ui_with_layout(vec2(width, width * 9.0 / 16.0 + 74.0), Layout::top_down(Align::LEFT), |ui| {
+                            let (rect, _) = ui.allocate_exact_size(vec2(width, width * 9.0 / 16.0), Sense::hover());
+                            ui.painter().rect_filled(rect, 12, theme::INPUT);
+                            if let Some(tex) = thumb {
+                                egui::Image::new(egui::load::SizedTexture::new(tex.id(), rect.size())).corner_radius(12).paint_at(ui, rect);
+                            } else {
+                                theme::paint_icon(ui.painter(), rect.center(), 28.0, Icon::Film, theme::TEXT3, 1.5);
+                            }
+                            let badge = ui.painter().layout_no_wrap(clock(duration), egui::FontId::new(12.0, egui::FontFamily::Monospace), theme::TEXT);
+                            let br = Rect::from_min_size(pos2(rect.right() - badge.size().x - 22.0, rect.bottom() - 30.0), badge.size() + vec2(16.0, 8.0));
+                            ui.painter().rect_filled(br, 6, Color32::from_black_alpha(190));
+                            ui.painter().galley(br.center() - badge.size() / 2.0, badge, theme::TEXT);
+                            let number = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(26.0, 26.0));
+                            ui.painter().circle_filled(number.center(), 13.0, theme::ACCENT);
+                            ui.painter().text(number.center(), egui::Align2::CENTER_CENTER, format!("{}", i + 1), egui::FontId::new(13.0, theme::bold_family()), theme::ON_ACCENT);
+                            ui.add(egui::Label::new(theme::bold(&name, 13.5)).truncate());
+                            ui.label(theme::mono(probe_text, 12.0).color(theme::TEXT3));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                if i > 0 && theme::small_button(ui, "Earlier").clicked() {
+                                    action = Some((i, -1));
+                                }
+                                if i + 1 < count && theme::small_button(ui, "Later").clicked() {
+                                    action = Some((i, 1));
+                                }
+                                if theme::small_button(ui, "Remove").clicked() {
+                                    action = Some((i, 0));
+                                }
+                            });
+                        });
+                    } else if i == count {
+                        let (rect, response) = ui.allocate_exact_size(vec2(width, width * 9.0 / 16.0), Sense::click());
+                        let painter = ui.painter();
+                        painter.rect(rect, 12, if response.hovered() { theme::CARD } else { Color32::from_rgb(0x14, 0x15, 0x18) }, Stroke::new(2.0, theme::LINE_STRONG), egui::StrokeKind::Inside);
+                        theme::paint_icon(painter, rect.center() - vec2(0.0, 12.0), 26.0, Icon::Plus, theme::ACCENT_TEXT, 2.0);
+                        painter.text(rect.center() + vec2(0.0, 22.0), egui::Align2::CENTER_CENTER, if self.mon.probing > 0 { "Reading clips…" } else { "Add clips" }, egui::FontId::new(14.0, theme::bold_family()), theme::TEXT);
+                        if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            add = true;
+                        }
+                    }
+                }
+            });
+            ui.add_space(8.0);
+        }
+        if add && let Some(paths) = rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v", "mts", "wmv"]).pick_files() {
+            self.add_clips(paths);
         }
         if let Some((i, step)) = action {
             match step {
                 0 => {
-                    self.mon.clips.remove(i);
+                    let gone = self.mon.clips.remove(i);
+                    self.mon.thumbs.remove(&gone.path);
                 }
                 s => self.mon.clips.swap(i, (i as i32 + s) as usize),
             }
             self.mon.plan = None;
             self.mon.tracks.clear();
         }
-        if self.mon.clips.is_empty() {
-            ui.label(RichText::new("No clips yet.").weak());
-        }
-    }
 
-    fn settings_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("2. Choices").strong().size(16.0));
-        egui::Grid::new("montage_settings").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
-            ui.label("Style");
-            ui.vertical(|ui| {
-                egui::ComboBox::from_id_salt("m_style").selected_text(self.mon.style.name()).width(280.0).show_ui(ui, |ui| {
-                    for s in Style::ALL {
-                        ui.selectable_value(&mut self.mon.style, s, s.name());
-                    }
+        ui.add_space(8.0);
+        ui.label(theme::bold("Style", 15.0));
+        let gap = 14.0;
+        let width = ((ui.available_width() - gap * 2.0) / 3.0).floor();
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for style in Style::ALL {
+                if choice_card(ui, width, style.name(), style.blurb(), self.mon.style == style).clicked() {
+                    self.mon.style = style;
+                }
+            }
+        });
+        ui.add_space(10.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let half = ((ui.available_width() - gap) / 2.0).floor();
+            ui.allocate_ui_with_layout(vec2(half, 0.0), Layout::top_down(Align::LEFT), |ui| {
+                theme::card(ui, |ui| {
+                    ui.label(theme::bold("Length", 14.0));
+                    ui.label(theme::muted("About how long the finished montage should be"));
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, secs) in [("30s", 30.0), ("1 min", 60.0), ("2 min", 120.0), ("3 min", 180.0), ("5 min", 300.0)] {
+                            let on = (self.mon.target - secs).abs() < 0.5;
+                            if chip(ui, label, on).clicked() {
+                                self.mon.target = secs;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(theme::soft("Exactly"));
+                        ui.add(egui::DragValue::new(&mut self.mon.target).range(10.0..=900.0).speed(1.0).suffix(" seconds"));
+                    });
                 });
-                ui.label(RichText::new(self.mon.style.blurb()).weak().small());
             });
-            ui.end_row();
-
-            ui.label("Length");
+            ui.allocate_ui_with_layout(vec2(half, 0.0), Layout::top_down(Align::LEFT), |ui| {
+                theme::card(ui, |ui| {
+                    ui.label(theme::bold("Sound", 14.0));
+                    ui.label(theme::muted(self.mon.sound.name()));
+                    theme::segmented(ui, &mut self.mon.sound, &[(Sound::MusicAndOriginal, "Music + game"), (Sound::OriginalOnly, "Game only"), (Sound::MusicOnly, "Music only")], true);
+                });
+            });
+        });
+        ui.add_space(4.0);
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.mon.target).range(10.0..=900.0).speed(1.0).suffix(" seconds"));
-                for (label, secs) in [("30s", 30.0), ("1 min", 60.0), ("2 min", 120.0), ("3 min", 180.0), ("5 min", 300.0)] {
-                    if ui.small_button(label).clicked() {
-                        self.mon.target = secs;
-                    }
-                }
+                ui.label(theme::bold("Colour look", 14.0));
+                ui.label(theme::muted("Each clip is corrected on its own, then given this look"));
             });
-            ui.end_row();
-
-            ui.label("Sound");
-            egui::ComboBox::from_id_salt("m_sound").selected_text(self.mon.sound.name()).width(320.0).show_ui(ui, |ui| {
-                for s in Sound::ALL {
-                    ui.selectable_value(&mut self.mon.sound, s, s.name());
-                }
-            });
-            ui.end_row();
-
-            ui.label("Colour look");
-            egui::ComboBox::from_id_salt("m_look").selected_text(self.mon.look.map_or("Natural (fix only)", |i| LOOKS[i].name)).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("m_look").selected_text(self.mon.look.map_or("Natural (fix only)", |i| LOOKS[i].name)).width(260.0).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.mon.look, None, "Natural (fix only)");
                 for (i, look) in LOOKS.iter().enumerate() {
                     ui.selectable_value(&mut self.mon.look, Some(i), look.name);
                 }
             });
-            ui.end_row();
-
-            ui.label("9:16 framing");
-            egui::ComboBox::from_id_salt("m_vertical").selected_text(match self.mon.vertical {
-                Vertical::Follow => "Follow the action",
-                Vertical::Centre => "Centre",
-                Vertical::Blur => "Whole picture on a blurred background",
-            }).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.mon.vertical, Vertical::Follow, "Follow the action");
-                ui.selectable_value(&mut self.mon.vertical, Vertical::Centre, "Centre");
-                ui.selectable_value(&mut self.mon.vertical, Vertical::Blur, "Whole picture on a blurred background");
-            });
-            ui.end_row();
-
-            if self.mon.vertical == Vertical::Blur {
-                ui.label("Main picture");
-                ui.vertical(|ui| {
-                    ui.add(egui::Slider::new(&mut self.mon.blur.zoom, 1.0..=2.0).text("zoom").fixed_decimals(2));
-                    ui.add(egui::Slider::new(&mut self.mon.blur.x, 0.0..=1.0).text("left / right").fixed_decimals(2));
-                    ui.add(egui::Slider::new(&mut self.mon.blur.y, 0.0..=1.0).text("up / down").fixed_decimals(2));
-                    if ui.small_button("Centre and reset").clicked() {
-                        self.mon.blur = BlurLayout::default();
-                    }
-                    ui.label(RichText::new("Zoom trims the sides so the picture fills more of the tall frame. Left / right only matters when zoomed.").weak().small());
-                });
-                ui.end_row();
-            }
-
-            ui.label("Anything special?");
-            ui.add(egui::TextEdit::multiline(&mut self.style_notes).desired_rows(2).desired_width(420.0));
-            ui.end_row();
+            ui.add_space(4.0);
+            ui.label(theme::bold("Anything special?", 14.0));
+            ui.add(egui::TextEdit::multiline(&mut self.style_notes).desired_rows(2).desired_width(f32::INFINITY).margin(Margin::symmetric(12, 9)));
         });
-
         if self.mon.sound.uses_music() {
-            ui.add_space(6.0);
-            ui.label(RichText::new("Music").strong());
+            self.music_card(ui);
+        }
+    }
+
+    fn music_card(&mut self, ui: &mut egui::Ui) {
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.radio_value(&mut self.mon.source, MusicSource::Online, "Find free music for me");
-                ui.radio_value(&mut self.mon.source, MusicSource::File, "Use my own file");
+                theme::icon(ui, Icon::Music, 16.0, theme::ACCENT_TEXT);
+                ui.label(theme::bold("Music", 14.0));
             });
+            theme::segmented(ui, &mut self.mon.source, &[(MusicSource::Online, "Find free music for me"), (MusicSource::File, "Use my own file")], false);
             match self.mon.source {
                 MusicSource::Online => {
-                    ui.label(RichText::new("Searches openly licensed music (CC0, public domain, CC BY, CC BY-SA, so it is safe in a monetised video). The AI chooses the mood. A credit line for your description is saved next to the montage.").weak().small());
+                    ui.label(theme::muted("Searches openly licensed music (CC0, public domain, CC BY, CC BY-SA), so it is safe in a monetised video. The AI chooses the mood. A credit line for your description is saved next to the montage."));
                     if self.mon.plan.is_some() {
                         let mut again = false;
                         ui.horizontal(|ui| {
-                            ui.label("Mood");
-                            ui.add(egui::TextEdit::singleline(&mut self.mon.music_query).desired_width(160.0));
-                            again = ui.add_enabled(!self.mon.searching, egui::Button::new("Search again")).clicked();
+                            ui.label(theme::soft("Mood"));
+                            ui.add(egui::TextEdit::singleline(&mut self.mon.music_query).desired_width(200.0).margin(Margin::symmetric(10, 7)));
+                            ui.add_enabled_ui(!self.mon.searching, |ui| again = theme::small_button(ui, "Search again").clicked());
                             if self.mon.searching {
                                 ui.spinner();
                             }
@@ -705,138 +884,243 @@ impl App {
                         if again {
                             self.search_music();
                         }
-                        if !self.mon.tracks.is_empty() {
-                            let label = self.mon.tracks.get(self.mon.track).map_or_else(String::new, Track::label);
-                            egui::ComboBox::from_id_salt("m_track").selected_text(label).width(520.0).show_ui(ui, |ui| {
-                                for (i, t) in self.mon.tracks.iter().enumerate() {
-                                    ui.selectable_value(&mut self.mon.track, i, t.label());
-                                }
-                            });
+                        let mut picked = None;
+                        for (i, t) in self.mon.tracks.iter().enumerate().take(8) {
+                            let on = self.mon.track == i;
+                            let response = Frame::new().fill(if on { theme::accent_soft(24) } else { theme::INPUT }).stroke(Stroke::new(if on { 1.5 } else { 1.0 }, if on { theme::ACCENT } else { theme::LINE_STRONG })).corner_radius(10).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(theme::bold(&t.title, 13.0)).truncate());
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        theme::pill(ui, &t.license.to_uppercase(), theme::TEXT2, theme::CARD, None);
+                                        ui.label(theme::mono(clock(t.seconds), 12.0).color(theme::TEXT3));
+                                    });
+                                });
+                                ui.label(theme::muted(&t.creator));
+                            }).response.interact(Sense::click());
+                            if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                picked = Some(i);
+                            }
                         }
+                        if let Some(i) = picked {
+                            self.mon.track = i;
+                        }
+                    } else {
+                        ui.label(theme::soft("After planning, songs that fit your montage appear here."));
                     }
                 }
                 MusicSource::File => {
                     ui.horizontal(|ui| {
-                        if ui.button("Choose music file…").clicked()
+                        if theme::button(ui, "Choose music file", Kind::Secondary, 0.0).clicked()
                             && let Some(f) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "wav", "m4a", "aac", "ogg", "flac"]).pick_file()
                         {
                             self.mon.file = Some(f);
                         }
-                        ui.label(self.mon.file.as_ref().map_or_else(|| "No file chosen".to_string(), |f| f.display().to_string()));
+                        ui.add(egui::Label::new(theme::mono(self.mon.file.as_ref().map_or_else(|| "No file chosen".to_string(), |f| f.display().to_string()), 12.0).color(theme::TEXT2)).truncate());
                     });
-                    ui.label(RichText::new("Make sure you have the right to use this song in your video.").weak().small());
+                    ui.label(theme::muted("Make sure you have the right to use this song in your video."));
                 }
             }
-        }
+        });
     }
 
-    fn plan_section(&mut self, ui: &mut egui::Ui) {
+    // -------------------------------------------------------------------- plan
+
+    fn plan_step(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("3. AI plan").strong().size(16.0));
-            let ready = !self.mon.clips.is_empty() && self.mon.busy.is_none() && self.mon.render.is_none();
-            if ui.add_enabled(ready && self.has_openai, egui::Button::new("Plan with AI")).on_hover_text("Sends small pictures from each clip to OpenAI (about 10 per clip). Your video files are not uploaded.").clicked() {
-                self.plan_montage();
-            }
-            egui::ComboBox::from_id_salt("m_model").selected_text(ai::OPENAI_MODELS[self.openai_model].1).show_ui(ui, |ui| {
-                for (i, (_, name)) in ai::OPENAI_MODELS.iter().enumerate() {
-                    ui.selectable_value(&mut self.openai_model, i, *name);
+            ui.label(theme::bold("Plan", 18.0));
+            ui.label(theme::soft("The moments the AI chose, in play order. Untick any you don't want."));
+        });
+        ui.add_space(6.0);
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                theme::icon(ui, Icon::Sparkle, 16.0, theme::ACCENT_TEXT);
+                ui.label(theme::bold("AI plan", 14.0));
+                ui.label(theme::muted("uses your own OpenAI key"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("m_model").selected_text(ai::OPENAI_MODELS[self.openai_model].1).width(150.0).show_ui(ui, |ui| {
+                        for (i, (_, name)) in ai::OPENAI_MODELS.iter().enumerate() {
+                            ui.selectable_value(&mut self.openai_model, i, *name);
+                        }
+                    });
+                });
+            });
+            ui.horizontal(|ui| {
+                let ready = !self.mon.clips.is_empty() && self.mon.busy.is_none() && self.mon.render.is_none();
+                ui.add_enabled_ui(ready && self.has_openai, |ui| {
+                    if theme::button(ui, if self.mon.plan.is_some() { "Plan again" } else { "Plan with AI" }, Kind::Secondary, 0.0).on_hover_text("Sends small pictures from each clip to OpenAI (about 10 per clip). Your video files are not uploaded.").clicked() {
+                        self.plan_montage();
+                    }
+                });
+                if let Some(text) = &self.mon.busy {
+                    ui.spinner();
+                    ui.label(theme::soft(text));
                 }
             });
-            if let Some(text) = &self.mon.busy {
-                ui.spinner();
-                ui.label(text);
-            }
+            theme::checkbox(ui, &mut self.reuse_ai, "Reuse saved AI answers when nothing changed (no tokens spent)");
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.reuse_ai, "Reuse saved AI answers").on_hover_text("When the clips and choices are unchanged, the saved plan is used instead of asking the AI again. No tokens spent. Untick for fresh ideas.");
-            if ui.small_button("Forget saved answers").clicked() {
-                let n = store::clear_ai_cache();
-                self.note(format!("Forgot {n} saved AI answer(s). The next plan will ask the AI again."));
+        let Some(plan) = &self.mon.plan else {
+            if self.mon.clips.is_empty() {
+                ui.label(theme::muted("Add clips on the first step, then plan."));
             }
-        });
-        if !self.has_openai {
+            return;
+        };
+        ui.add_space(4.0);
+        ui.label(theme::muted(format!("Tempo the AI suggests: {}", plan.tempo)));
+        if self.mon.style == Style::Story {
+            theme::card(ui, |ui| {
+                ui.label(theme::bold("Title shown at the start", 14.0));
+                ui.add(egui::TextEdit::singleline(&mut self.mon.title).desired_width(f32::INFINITY).margin(Margin::symmetric(12, 9)));
+            });
+        }
+        // The cuts as one bar: width is length, colour is the clip.
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("OpenAI key");
-                ui.add(egui::TextEdit::singleline(&mut self.openai_key).password(true).hint_text("paste your key").desired_width(220.0));
-                if ui.button("Save").clicked() {
-                    match ai::save_key(ai::Provider::OpenAi, &self.openai_key) {
-                        Ok(()) => {
-                            self.openai_key.clear();
-                            self.has_openai = ai::load_key(ai::Provider::OpenAi).is_some();
+                ui.label(theme::bold("The montage at a glance", 14.0));
+                let kept: f64 = plan.cuts.iter().zip(&self.mon.keep).filter(|(_, k)| **k).map(|(c, _)| c.len()).sum();
+                ui.label(theme::mono(format!("{} kept", clock(kept)), 12.5).color(theme::TEXT2));
+            });
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
+            let total: f64 = plan.cuts.iter().map(Cut::len).sum::<f64>().max(0.1);
+            let mut x = rect.left();
+            for (i, cut) in plan.cuts.iter().enumerate() {
+                let w = (rect.width() as f64 * cut.len() / total) as f32;
+                let colour = clip_colour(cut.clip);
+                let block = Rect::from_min_size(pos2(x, rect.top()), vec2((w - 2.0).max(2.0), rect.height()));
+                ui.painter().rect_filled(block, 5, if self.mon.keep[i] { colour } else { theme::tint(colour, 40) });
+                x += w;
+            }
+            ui.horizontal_wrapped(|ui| {
+                for (i, clip) in self.mon.clips.iter().enumerate() {
+                    let (dot, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, clip_colour(i));
+                    ui.label(theme::muted(format!("{}. {}", i + 1, clip.name())));
+                }
+            });
+        });
+        theme::card(ui, |ui| {
+            ui.label(theme::bold("Moments", 14.0));
+            for (i, cut) in plan.cuts.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    theme::checkbox(ui, &mut self.mon.keep[i], "");
+                    let (dot, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, clip_colour(cut.clip));
+                    ui.label(theme::mono(format!("{} to {}", clock(cut.start), clock(cut.end)), 12.5).color(theme::TEXT2));
+                    ui.label(theme::mono(format!("{:.0}%", cut.score * 100.0), 12.5).color(if cut.score > 0.7 { theme::OK } else { theme::TEXT3 }));
+                    ui.add(egui::Label::new(theme::soft(&cut.why)).truncate());
+                });
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------- make
+
+    fn make_step(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(theme::bold("Make", 18.0));
+            ui.label(theme::soft("Choose the shapes and where they are saved."));
+        });
+        ui.add_space(6.0);
+        let working = self.mon.render.is_some();
+        ui.add_enabled_ui(!working, |ui| {
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::checkbox(ui, &mut self.mon.make_wide, "");
+                    ui.label(theme::bold("16:9 video", 14.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(theme::muted("For YouTube")));
+                });
+            });
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::checkbox(ui, &mut self.mon.make_vertical, "");
+                    ui.label(theme::bold("9:16 video", 14.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(theme::muted("Shorts, Reels, TikTok")));
+                });
+                if self.mon.make_vertical {
+                    theme::segmented(ui, &mut self.mon.vertical, &[(Vertical::Follow, "Follow"), (Vertical::Centre, "Centre"), (Vertical::Blur, "Blurred")], true);
+                    ui.label(theme::muted(match self.mon.vertical {
+                        Vertical::Follow => "A calm virtual camera that pans toward movement and detail.",
+                        Vertical::Centre => "Always the middle of the picture.",
+                        Vertical::Blur => "The whole picture over a blurred copy of itself. Zoom trims the sides so it fills more of the tall frame.",
+                    }));
+                    if self.mon.vertical == Vertical::Blur {
+                        theme::slider_row(ui, "Zoom", &mut self.mon.blur.zoom, 1.0..=2.0, 1.0, false);
+                        theme::slider_row(ui, "Left / right", &mut self.mon.blur.x, 0.0..=1.0, 0.0, false);
+                        theme::slider_row(ui, "Up / down", &mut self.mon.blur.y, 0.0..=1.0, 0.0, false);
+                        if theme::small_button(ui, "Centre and reset").clicked() {
+                            self.mon.blur = BlurLayout::default();
                         }
-                        Err(e) => self.fail(e),
                     }
                 }
-                ui.label(RichText::new("Stored in your computer's secure credential store.").weak().small());
             });
-        }
-        let Some(plan) = &self.mon.plan else { return };
-        ui.label(RichText::new(format!("Tempo the AI suggests: {}", plan.tempo)).weak().small());
-        if self.mon.style == Style::Story {
-            ui.horizontal(|ui| {
-                ui.label("Title shown at the start");
-                ui.add(egui::TextEdit::singleline(&mut self.mon.title).desired_width(260.0));
+            theme::card(ui, |ui| {
+                ui.label(theme::bold("Speed", 14.0));
+                self.encoder_picker(ui, false);
             });
-        }
-        egui::ScrollArea::vertical().id_salt("plan_rows").max_height(260.0).show(ui, |ui| {
-            egui::Grid::new("plan").striped(true).num_columns(5).spacing([12.0, 4.0]).show(ui, |ui| {
-                for h in ["Keep", "Clip", "From to", "Score", "Why"] {
-                    ui.label(RichText::new(h).weak().small());
-                }
-                ui.end_row();
-                for (i, cut) in plan.cuts.iter().enumerate() {
-                    ui.checkbox(&mut self.mon.keep[i], "");
-                    ui.label(self.mon.clips.get(cut.clip).map_or_else(|| "?".to_string(), Clip::name));
-                    ui.label(format!("{} to {}  ({:.1}s)", clock(cut.start), clock(cut.end), cut.len()));
-                    ui.label(format!("{:.0}%", cut.score * 100.0));
-                    ui.label(RichText::new(&cut.why).small());
-                    ui.end_row();
-                }
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::icon(ui, Icon::Folder, 18.0, theme::TEXT3);
+                    let shown = self.mon.out_dir.clone().or_else(|| self.mon.clips.first().and_then(|c| c.path.parent().map(PathBuf::from)));
+                    let text = shown.map_or_else(|| "next to the first clip".to_string(), |d| d.display().to_string());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::small_button(ui, "Change").clicked()
+                            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                        {
+                            self.mon.out_dir = Some(dir);
+                        }
+                        ui.add(egui::Label::new(theme::mono(text, 12.0).color(theme::TEXT2)).truncate());
+                    });
+                });
             });
         });
+        if self.mon.plan.is_none() {
+            ui.label(theme::muted("Plan with AI first, on the Plan step."));
+        }
     }
+}
 
-    fn make_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("4. Make it").strong().size(16.0));
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.mon.make_wide, "16:9");
-            ui.checkbox(&mut self.mon.make_vertical, "9:16");
-            ui.label("Save to");
-            let shown = self.mon.out_dir.clone().or_else(|| self.mon.clips.first().and_then(|c| c.path.parent().map(PathBuf::from)));
-            ui.label(RichText::new(shown.map_or_else(|| "next to the first clip".to_string(), |d| d.display().to_string())).small());
-            if ui.button("Choose folder…").clicked()
-                && let Some(dir) = rfd::FileDialog::new().pick_folder()
-            {
-                self.mon.out_dir = Some(dir);
-            }
+/// The three style cards.
+fn choice_card(ui: &mut egui::Ui, width: f32, title: &str, blurb: &str, selected: bool) -> egui::Response {
+    let galley = ui.painter().layout(blurb.to_string(), egui::FontId::proportional(13.0), theme::TEXT2, width - 32.0);
+    let height = 52.0 + galley.size().y + 16.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height.max(120.0)), Sense::click());
+    let painter = ui.painter();
+    let fill = if selected { theme::accent_soft(26) } else if response.hovered() { theme::RAISED } else { theme::CARD };
+    painter.rect(rect, 12, fill, Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { theme::ACCENT } else { theme::LINE_SOFT }), egui::StrokeKind::Inside);
+    theme::radio_dot(painter, pos2(rect.left() + 26.0, rect.top() + 26.0), selected);
+    painter.text(pos2(rect.left() + 46.0, rect.top() + 26.0), egui::Align2::LEFT_CENTER, title, egui::FontId::new(14.5, theme::bold_family()), theme::TEXT);
+    painter.galley(pos2(rect.left() + 16.0, rect.top() + 52.0), galley, theme::TEXT2);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A small choice chip, like "1 min".
+fn chip(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(13.0, theme::bold_family()), if on { theme::ON_ACCENT } else { theme::TEXT2 });
+    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + 28.0, 32.0), Sense::click());
+    ui.painter().rect(rect, 16, if on { theme::ACCENT } else { theme::INPUT }, Stroke::new(1.0, if on { theme::ACCENT } else { theme::LINE_STRONG }), egui::StrokeKind::Inside);
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, theme::TEXT);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(theme::muted(label));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(egui::Label::new(RichText::new(value).size(13.0).color(theme::TEXT)).truncate());
         });
-        self.encoder_picker(ui, false);
-        if let Some((progress, label, cancel)) = &self.mon.render {
-            ui.label(label);
-            ui.add(egui::ProgressBar::new(*progress).show_percentage());
-            if ui.button("Cancel").clicked() {
-                cancel.store(true, Ordering::Relaxed);
-            }
-        } else {
-            let ready = self.mon.plan.is_some() && self.mon.busy.is_none();
-            if ui.add_enabled(ready, egui::Button::new(RichText::new("Make montage").strong().size(16.0)).fill(Color32::from_rgb(214, 92, 51)).min_size(vec2(220.0, 34.0))).clicked() {
-                self.render_montage();
-            }
-            if !ready {
-                ui.label(RichText::new("Plan with AI first.").weak().small());
-            }
-        }
-        if !self.mon.made.is_empty() {
-            ui.add_space(6.0);
-            ui.label(RichText::new("Made:").strong());
-            for file in &self.mon.made {
-                ui.label(RichText::new(file.display().to_string()).small());
-            }
-        }
-        ui.add_space(10.0);
-        ui.separator();
-        self.pack_ui(ui, pack_ui::Target::Montage);
-    }
+    });
+}
+
+/// One colour per clip, so the plan bar and the moment list match.
+fn clip_colour(i: usize) -> Color32 {
+    const PALETTE: [Color32; 6] = [Color32::from_rgb(0xFF, 0x6B, 0x3D), Color32::from_rgb(0x5B, 0xA8, 0xFF), Color32::from_rgb(0x62, 0xD0, 0x8F), Color32::from_rgb(0xF4, 0xBE, 0x4F), Color32::from_rgb(0xC0, 0x84, 0xFC), Color32::from_rgb(0xFF, 0x8F, 0xB8)];
+    PALETTE[i % PALETTE.len()]
+}
+
+/// A small picture from a third of the way into a clip.
+fn grab_thumb(tools: &media::Tools, probe: &Probe, path: &Path) -> Option<media::Frame> {
+    let options = media::GrabOptions { width: 480, finish: media::Finish { sharpen: 0.0, denoise: 0.0, loudness: false }, crop_wide: false };
+    media::grab_frame(tools, probe, path, probe.duration / 3.0, &options).ok()
 }
 
 fn media_progress(mail: &crate::Mailbox, done: f32, steps: f32, label: &str) {

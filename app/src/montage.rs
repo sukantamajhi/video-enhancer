@@ -79,8 +79,6 @@ pub enum Sound {
 }
 
 impl Sound {
-    pub const ALL: [Sound; 3] = [Sound::MusicAndOriginal, Sound::OriginalOnly, Sound::MusicOnly];
-
     pub fn name(self) -> &'static str {
         match self {
             Sound::MusicAndOriginal => "Music, with the original sound underneath",

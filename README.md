@@ -11,6 +11,21 @@ cargo run --release
 
 The first time, press **Download video tools** (FFmpeg, about 110 MB, checked against its published SHA-256 before use). If FFmpeg is already on your PATH it is used instead.
 
+## How the window works
+
+A narrow rail on the left walks you through four steps; a green tick appears on each one you have finished.
+
+| | Video | Montage |
+|---|---|---|
+| 1 | **Source**: drop or open one video. Recent videos come back with their look and AI results. | **Clips**: add clips, choose a style, length, sound, look and music. |
+| 2 | **Look**: before/after preview, a strip of the eight looks drawn from your own frame, sliders, trim timeline, AI assist. | **Plan**: the moments the AI chose, as a bar and a list you can untick. |
+| 3 | **Export**: 16:9 and 9:16 previews, framing, extras, speed, folder. | **Make**: shapes, framing, speed, folder. |
+| 4 | **Publish**: titles, description, chapters, tags, search check, thumbnail. | The same Publish screen. |
+
+The **Video / Montage** switch and the **Settings** button (API keys, saved AI answers) are in the top bar. Running jobs show as a card at the bottom left with a Cancel button. Dropping several files on the Video screen starts a montage.
+
+Colours, type and shapes live in `app/src/theme.rs`. Text uses the system fonts (Segoe UI, Cascadia Mono). Put `Manrope-Medium.ttf`, `Manrope-ExtraBold.ttf` and `JetBrainsMono-Medium.ttf` in `app/assets/fonts` (next to where you run the app) and they are used instead.
+
 ## What it does
 
 - **Before/after preview**: slide, side by side, or either alone. Drop a file on the window or press Open video.
