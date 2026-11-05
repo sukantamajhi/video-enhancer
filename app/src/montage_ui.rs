@@ -244,7 +244,7 @@ impl State {
     }
 
     pub fn busy_text(&self) -> Option<String> {
-        self.busy.clone().or_else(|| self.searching.then(|| "Searching for free music…".to_string()))
+        self.busy.clone().or_else(|| self.searching.then(|| "Searching NCS for music…".to_string()))
     }
 
     pub fn pack_busy(&self) -> Option<String> {
@@ -376,7 +376,7 @@ impl App {
                     Ok(tracks) => {
                         self.mon.tracks = tracks;
                         self.mon.track = 0;
-                        self.note("Found free music that fits. The first song is selected; pick another if you like.");
+                        self.note("Found NCS music that fits. The first song is selected; pick another if you like.");
                     }
                     Err(e) => self.fail(e),
                 }
@@ -407,7 +407,8 @@ impl App {
         let (Some(saved), Some(tools)) = (store::load::<Saved>("montage"), self.tools.clone()) else { return };
         let m = &mut self.mon;
         (m.style, m.sound, m.vertical, m.target, m.look, m.source) = (saved.style, saved.sound, saved.vertical, saved.target.clamp(10.0, 900.0), saved.look.filter(|i| *i < LOOKS.len()), saved.source);
-        (m.file, m.tracks, m.music_query, m.title) = (saved.file, saved.tracks, saved.music_query, saved.title);
+        // Songs saved by an older version came from other catalogues; only NCS tracks are kept.
+        (m.file, m.tracks, m.music_query, m.title) = (saved.file, saved.tracks.into_iter().filter(|t| t.license == "ncs").collect(), saved.music_query, saved.title);
         m.track = saved.track.min(m.tracks.len().saturating_sub(1));
         (m.make_wide, m.make_vertical, m.out_dir) = (saved.make_wide, saved.make_vertical, saved.out_dir.filter(|d| d.is_dir()));
         m.blur = saved.blur.clamped();
@@ -506,7 +507,7 @@ impl App {
             let query = result.as_ref().ok().map(|p| p.music_query.clone());
             mail.send(Msg::Montage(Event::Plan(result)));
             if let (true, Some(query)) = (wants_music, query) {
-                note("Searching for free music…".into());
+                note("Searching NCS for music…".into());
                 mail.send(Msg::Montage(Event::Tracks(music::search(&query, target))));
             }
         });
@@ -529,7 +530,7 @@ impl App {
         let candidates: Vec<Track> = if m.source == MusicSource::Online { m.tracks.iter().cycle().skip(m.track).take(m.tracks.len().min(4)).cloned().collect() } else { Vec::new() };
         let file = (m.source == MusicSource::File).then(|| m.file.clone()).flatten();
         if m.sound.uses_music() && candidates.is_empty() && file.is_none() {
-            self.fail("Choose music first: search for free music, pick your own file, or switch the sound to original only.");
+            self.fail("Choose music first: find NCS music, pick your own file, or switch the sound to original only.");
             return;
         }
         let (clips, grades, style, sound, vertical, target) = (m.clips.clone(), plan.grades.clone(), m.style, m.sound, m.vertical, m.target);
@@ -564,8 +565,8 @@ impl App {
                             for t in &candidates {
                                 say(0.0, &format!("Downloading \"{}\"…", t.title));
                                 match music::download(t, &work) {
-                                    Ok(p) => {
-                                        used = Some(t.clone());
+                                    Ok((p, track)) => {
+                                        used = Some(track);
                                         found = Some(p);
                                         break;
                                     }
@@ -1102,10 +1103,10 @@ impl App {
                 theme::icon(ui, Icon::Music, 16.0, theme::ACCENT_TEXT);
                 ui.label(theme::bold("Music", 14.0));
             });
-            theme::segmented(ui, &mut self.mon.source, &[(MusicSource::Online, "Find free music for me"), (MusicSource::File, "Use my own file")], false);
+            theme::segmented(ui, &mut self.mon.source, &[(MusicSource::Online, "NCS music (no copyright claims)"), (MusicSource::File, "Use my own file")], false);
             match self.mon.source {
                 MusicSource::Online => {
-                    ui.label(theme::muted("Searches openly licensed music (CC0, public domain, CC BY, CC BY-SA), so it is safe in a monetised video. The AI chooses the mood. A credit line for your description is saved next to the montage."));
+                    ui.label(theme::muted("Music from NCS (NoCopyrightSounds), made for creators: free in monetised YouTube and Twitch videos with no copyright strikes. The AI chooses the mood. NCS asks you to credit the song in your description, so the exact credit text is saved next to the montage and added to your upload pack."));
                     if self.mon.plan.is_some() {
                         let mut again = false;
                         ui.horizontal(|ui| {
@@ -1127,11 +1128,10 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Label::new(theme::bold(&t.title, 13.0)).truncate());
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        theme::pill(ui, &t.license.to_uppercase(), theme::TEXT2, theme::CARD, None);
-                                        ui.label(theme::mono(clock(t.seconds), 12.0).color(theme::TEXT3));
+                                        theme::pill(ui, if t.instrumental { "Instrumental" } else { "With vocals" }, theme::TEXT2, theme::CARD, None);
                                     });
                                 });
-                                ui.label(theme::muted(&t.creator));
+                                ui.label(theme::muted(format!("{} · {}", t.creator, t.source)));
                             }).response.interact(Sense::click());
                             if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                 picked = Some(i);

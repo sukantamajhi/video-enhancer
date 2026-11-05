@@ -251,7 +251,9 @@ impl Pack {
             parts.push(format!("Chapters:\n{}", lines.join("\n")));
         }
         if !self.credit.trim().is_empty() {
-            parts.push(format!("Music: {}", self.credit.trim()));
+            let credit = self.credit.trim();
+            // NCS's own credit is several lines and starts with "Song:", so it needs no label.
+            parts.push(if credit.contains('\n') { credit.to_string() } else { format!("Music: {credit}") });
         }
         if !self.hashtags.is_empty() {
             parts.push(self.hashtags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
