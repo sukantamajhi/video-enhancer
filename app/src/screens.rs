@@ -95,6 +95,7 @@ impl App {
     pub fn switch_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.player = None;
+        self.mon.stop_preview();
         self.step = Step::Source;
         self.status_is_error = false;
         self.status = match mode {

@@ -23,6 +23,8 @@ pub enum Event {
     Probed(PathBuf, Result<Probe, String>),
     /// A small picture of a clip, for its card.
     Thumb(PathBuf, media::Frame),
+    /// A still picture of one moment, for the preview.
+    PreviewFrame(usize, Result<media::Frame, String>),
     /// The clips of the last session, probed again. The number is how many were saved.
     Restored(Vec<Clip>, usize),
     Note(String),
@@ -110,6 +112,20 @@ pub struct State {
     rendered: Vec<Cut>,
     credit: String,
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
+    preview: Preview,
+}
+
+/// The montage preview: which moment is showing, and the player that runs through them.
+#[derive(Default)]
+struct Preview {
+    cur: usize,
+    player: Option<media::Player>,
+    tex: Option<egui::TextureHandle>,
+    t: f64,
+    busy: bool,
+    phone: bool,
+    started: bool,
+    lut: Option<(usize, Lut)>,
 }
 
 impl State {
@@ -142,6 +158,7 @@ impl State {
             rendered: Vec::new(),
             credit: String::new(),
             thumbs: HashMap::new(),
+            preview: Preview::default(),
         }
     }
 
@@ -182,7 +199,7 @@ impl State {
 
     /// True while something is running that needs the window to keep refreshing.
     pub fn working(&self) -> bool {
-        self.busy.is_some() || self.render.is_some() || self.searching || self.probing > 0 || self.pack.working()
+        self.busy.is_some() || self.render.is_some() || self.searching || self.probing > 0 || self.pack.working() || self.preview.player.is_some()
     }
 
     pub fn pack_state(&mut self) -> &mut PackState {
@@ -195,6 +212,10 @@ impl State {
         let rendered = !self.rendered.is_empty();
         let cuts: Vec<Cut> = if rendered { self.rendered.clone() } else { plan.cuts.iter().zip(&self.keep).filter(|(_, k)| **k).map(|(c, _)| c.clone()).collect() };
         (!cuts.is_empty() && !self.clips.is_empty()).then(|| MontageFacts { clips: self.clips.clone(), cuts, grades: plan.grades.clone(), style: self.style, title: self.title.clone(), credit: self.credit.clone(), out_dir: self.out_dir.clone(), rendered })
+    }
+
+    pub fn stop_preview(&mut self) {
+        self.preview.player = None;
     }
 
     pub fn summary_line(&self) -> String {
@@ -318,9 +339,22 @@ impl App {
                 let tex = self.mail.ctx.load_texture(format!("clip-{}", path.display()), image, egui::TextureOptions::LINEAR);
                 self.mon.thumbs.insert(path, tex);
             }
+            Event::PreviewFrame(i, result) => {
+                self.mon.preview.busy = false;
+                match result {
+                    Ok(frame) if i == self.mon.preview.cur && self.mon.preview.player.is_none() => {
+                        if let Some(clip) = self.mon.plan.as_ref().and_then(|p| p.cuts.get(i)).map(|c| c.clip) {
+                            self.preview_show(clip, &frame);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.fail(e),
+                }
+            }
             Event::Note(text) => self.note(text),
             Event::Plan(Ok(plan)) => {
                 self.mon.busy = None;
+                self.mon.preview = Preview::default();
                 self.mon.keep = vec![true; plan.cuts.len()];
                 self.mon.rendered.clear();
                 self.mon.credit.clear();
@@ -594,6 +628,7 @@ impl App {
     }
 
     pub fn montage_screen(&mut self, ui: &mut egui::Ui, step: Step) {
+        self.preview_tick();
         self.montage_summary(ui, step);
         egui::CentralPanel::default().frame(Frame::new().fill(theme::WINDOW)).show(ui, |ui| {
             // VE_SCROLL=900 starts the page scrolled down, for screenshots of the lower sections.
@@ -609,6 +644,206 @@ impl App {
                 });
             });
         });
+    }
+
+    // ----------------------------------------------------------------- preview
+
+    fn preview_kept(&self) -> Vec<usize> {
+        self.mon.keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect()
+    }
+
+    /// Shows one moment as a still picture, and moves the preview to it.
+    fn preview_select(&mut self, i: usize) {
+        let Some(tools) = self.tools.clone() else { return };
+        let Some(cut) = self.mon.plan.as_ref().and_then(|p| p.cuts.get(i).cloned()) else { return };
+        let Some(clip) = self.mon.clips.get(cut.clip).cloned() else { return };
+        let p = &mut self.mon.preview;
+        (p.player, p.cur, p.t, p.busy, p.started) = (None, i, cut.start, true, true);
+        let mail = self.mail.clone();
+        std::thread::spawn(move || {
+            let options = media::GrabOptions { width: 960, finish: media::Finish { sharpen: 0.0, denoise: 0.0, loudness: false }, crop_wide: false };
+            let at = cut.start + cut.len() * 0.3;
+            mail.send(Msg::Montage(Event::PreviewFrame(i, media::grab_frame(&tools, &clip.probe, &clip.path, at, &options))));
+        });
+    }
+
+    fn preview_play_from(&mut self, i: usize) {
+        let Some(tools) = self.tools.clone() else { return };
+        let Some(cut) = self.mon.plan.as_ref().and_then(|p| p.cuts.get(i).cloned()) else { return };
+        let Some(clip) = self.mon.clips.get(cut.clip).cloned() else { return };
+        let ctx = self.mail.ctx.clone();
+        let p = &mut self.mon.preview;
+        (p.cur, p.t, p.started) = (i, cut.start, true);
+        p.player = Some(media::play(&tools, &clip.probe, &clip.path, cut.start, move || ctx.request_repaint()));
+    }
+
+    fn preview_toggle(&mut self) {
+        if self.mon.preview.player.is_some() {
+            self.mon.preview.player = None;
+            return;
+        }
+        let kept = self.preview_kept();
+        let cur = self.mon.preview.cur;
+        let Some(first) = kept.first().copied() else { return };
+        let start = if kept.contains(&cur) { cur } else { kept.iter().copied().find(|k| *k > cur).unwrap_or(first) };
+        self.preview_play_from(start);
+    }
+
+    /// Draws a decoded frame with the colour of its clip.
+    fn preview_show(&mut self, clip: usize, frame: &media::Frame) {
+        let Some(grade) = self.mon.plan.as_ref().and_then(|p| p.grades.get(clip).copied()) else { return };
+        if self.mon.preview.lut.as_ref().is_none_or(|(c, _)| *c != clip) {
+            self.mon.preview.lut = Some((clip, Lut::build(17, &grade, None)));
+        }
+        let graded = self.mon.preview.lut.as_ref().map(|(_, l)| l.apply(&frame.rgb)).unwrap_or_default();
+        let size = [frame.width, frame.height];
+        let image = egui::ColorImage::from_rgb(size, &graded);
+        let options = egui::TextureOptions::LINEAR;
+        match &mut self.mon.preview.tex {
+            Some(tex) if tex.size() == size => tex.set(image, options),
+            slot => *slot = Some(self.mail.ctx.load_texture("montage-preview", image, options)),
+        }
+    }
+
+    /// Moves playback along: new frames to the screen, and on to the next kept moment at the end of one.
+    fn preview_tick(&mut self) {
+        let Some(cut) = self.mon.plan.as_ref().and_then(|p| p.cuts.get(self.mon.preview.cur).cloned()) else { return };
+        let (mut latest, mut ended) = (None, false);
+        if let Some(player) = &self.mon.preview.player {
+            loop {
+                match player.rx.try_recv() {
+                    Ok(item) => latest = Some(item),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((t, frame)) = latest {
+            self.preview_show(cut.clip, &frame);
+            self.mon.preview.t = t;
+            ended |= t >= cut.end;
+        }
+        if ended && self.mon.preview.player.is_some() {
+            let cur = self.mon.preview.cur;
+            match self.preview_kept().into_iter().find(|k| *k > cur) {
+                Some(next) => self.preview_play_from(next),
+                None => self.mon.preview.player = None,
+            }
+        }
+    }
+
+    /// The picture, the play controls and the moments as one clickable bar.
+    fn preview_card(&mut self, ui: &mut egui::Ui) {
+        let Some(plan) = &self.mon.plan else { return };
+        let cuts = plan.cuts.clone();
+        let (cur, playing, phone) = (self.mon.preview.cur.min(cuts.len().saturating_sub(1)), self.mon.preview.player.is_some(), self.mon.preview.phone);
+        let tex = self.mon.preview.tex.clone();
+        let kept: Vec<usize> = self.preview_kept();
+        let (mut select, mut toggle, mut step) = (None, false, 0i32);
+        let mut phone_now = phone;
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::bold("Preview", 14.0));
+                ui.label(theme::muted("A quick silent look. Music, fades and exact colour come when you make it."));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    theme::segmented(ui, &mut phone_now, &[(true, "9:16"), (false, "16:9")], false);
+                });
+            });
+            let (region, _) = ui.allocate_exact_size(vec2(ui.available_width(), 330.0), Sense::hover());
+            ui.painter().rect_filled(region, 12, Color32::from_rgb(0x0B, 0x0B, 0x0D));
+            if let Some(tex) = &tex {
+                let aspect = tex.size()[0] as f32 / tex.size()[1].max(1) as f32;
+                if phone_now {
+                    let h = region.height() - 20.0;
+                    paint_phone(ui, Rect::from_center_size(region.center(), vec2(h * 9.0 / 16.0, h)), tex, self.mon.vertical, self.mon.blur);
+                } else {
+                    let w = (region.width() - 20.0).min((region.height() - 20.0) * aspect);
+                    let r = Rect::from_center_size(region.center(), vec2(w, w / aspect));
+                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), r.size())).corner_radius(10).paint_at(ui, r);
+                }
+            } else {
+                ui.painter().text(region.center(), egui::Align2::CENTER_CENTER, if self.mon.preview.busy { "Getting the picture…" } else { "Pick a moment" }, egui::FontId::proportional(14.0), theme::TEXT3);
+            }
+            let kept_total: f64 = kept.iter().map(|&i| cuts[i].len()).sum();
+            let done: f64 = kept.iter().filter(|&&i| i < cur).map(|&i| cuts[i].len()).sum::<f64>() + if kept.contains(&cur) { (self.mon.preview.t - cuts[cur].start).clamp(0.0, cuts[cur].len()) } else { 0.0 };
+            ui.horizontal(|ui| {
+                if theme::round_button(ui, if playing { Icon::Pause } else { Icon::Play }, if playing { "Pause" } else { "Play" }).clicked() {
+                    toggle = true;
+                }
+                if theme::small_button(ui, "Previous").clicked() {
+                    step = -1;
+                }
+                if theme::small_button(ui, "Next").clicked() {
+                    step = 1;
+                }
+                ui.label(theme::mono(format!("{} / {}", clock(done), clock(kept_total)), 13.0).color(theme::TEXT));
+                if let Some(cut) = cuts.get(cur) {
+                    let name = self.mon.clips.get(cut.clip).map_or_else(String::new, Clip::name);
+                    ui.add(egui::Label::new(theme::muted(format!("Moment {} of {} · {} · {}", cur + 1, cuts.len(), name, cut.why))).truncate());
+                }
+            });
+            // The moments as one bar: width is length, colour is the clip. Click one to look at it.
+            let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+            let total: f64 = cuts.iter().map(Cut::len).sum::<f64>().max(0.1);
+            let mut x = rect.left();
+            let mut head = None;
+            for (i, cut) in cuts.iter().enumerate() {
+                let w = (rect.width() as f64 * cut.len() / total) as f32;
+                let colour = clip_colour(cut.clip);
+                let block = Rect::from_min_size(pos2(x, rect.top()), vec2((w - 2.0).max(2.0), rect.height()));
+                let on = self.mon.keep.get(i).copied().unwrap_or(true);
+                ui.painter().rect_filled(block, 5, if on { colour } else { theme::tint(colour, 40) });
+                if i == cur {
+                    ui.painter().rect_stroke(block.expand(1.0), 6, Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Outside);
+                    head = Some(block.left() + block.width() * ((self.mon.preview.t - cut.start) / cut.len().max(0.1)).clamp(0.0, 1.0) as f32);
+                }
+                if response.clicked() && response.interact_pointer_pos().is_some_and(|p| p.x >= x && p.x < x + w) {
+                    select = Some(i);
+                }
+                x += w;
+            }
+            if let Some(h) = head {
+                ui.painter().rect_filled(Rect::from_min_max(pos2(h - 1.0, rect.top() - 4.0), pos2(h + 1.0, rect.bottom() + 4.0)), 1, Color32::WHITE);
+            }
+            ui.horizontal_wrapped(|ui| {
+                for (i, clip) in self.mon.clips.iter().enumerate() {
+                    let (dot, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, clip_colour(i));
+                    ui.label(theme::muted(format!("{}. {}", i + 1, clip.name())));
+                }
+            });
+        });
+        self.mon.preview.phone = phone_now;
+        if step != 0 {
+            let at = kept.iter().position(|&k| k >= cur);
+            let target = match (step, at) {
+                (1, Some(p)) if kept.get(p) == Some(&cur) => kept.get(p + 1),
+                (1, Some(p)) => kept.get(p),
+                (_, Some(p)) => p.checked_sub(1).and_then(|q| kept.get(q)),
+                (1, None) => None,
+                (_, None) => kept.last(),
+            };
+            select = target.copied().or(select);
+        }
+        if let Some(i) = select {
+            let was_playing = self.mon.preview.player.is_some();
+            if was_playing && kept.contains(&i) {
+                self.preview_play_from(i);
+            } else {
+                self.preview_select(i);
+            }
+        } else if toggle {
+            self.preview_toggle();
+        } else if tex.is_none() && !self.mon.preview.busy && !self.mon.preview.started && let Some(first) = kept.first() {
+            self.preview_select(*first);
+            // Developer aid: VE_PLAY=1 starts playing at once, for screenshots.
+            if std::env::var_os("VE_PLAY").is_some() {
+                self.preview_toggle();
+            }
+        }
     }
 
     // ------------------------------------------------------------------ summary
@@ -965,6 +1200,9 @@ impl App {
             }
             return;
         };
+        let _ = plan;
+        self.preview_card(ui);
+        let Some(plan) = &self.mon.plan else { return };
         ui.add_space(4.0);
         ui.label(theme::muted(format!("Tempo the AI suggests: {}", plan.tempo)));
         if self.mon.style == Style::Story {
@@ -973,31 +1211,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.mon.title).desired_width(f32::INFINITY).margin(Margin::symmetric(12, 9)));
             });
         }
-        // The cuts as one bar: width is length, colour is the clip.
-        theme::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(theme::bold("The montage at a glance", 14.0));
-                let kept: f64 = plan.cuts.iter().zip(&self.mon.keep).filter(|(_, k)| **k).map(|(c, _)| c.len()).sum();
-                ui.label(theme::mono(format!("{} kept", clock(kept)), 12.5).color(theme::TEXT2));
-            });
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
-            let total: f64 = plan.cuts.iter().map(Cut::len).sum::<f64>().max(0.1);
-            let mut x = rect.left();
-            for (i, cut) in plan.cuts.iter().enumerate() {
-                let w = (rect.width() as f64 * cut.len() / total) as f32;
-                let colour = clip_colour(cut.clip);
-                let block = Rect::from_min_size(pos2(x, rect.top()), vec2((w - 2.0).max(2.0), rect.height()));
-                ui.painter().rect_filled(block, 5, if self.mon.keep[i] { colour } else { theme::tint(colour, 40) });
-                x += w;
-            }
-            ui.horizontal_wrapped(|ui| {
-                for (i, clip) in self.mon.clips.iter().enumerate() {
-                    let (dot, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 5.0, clip_colour(i));
-                    ui.label(theme::muted(format!("{}. {}", i + 1, clip.name())));
-                }
-            });
-        });
+        let mut view = None;
         theme::card(ui, |ui| {
             ui.label(theme::bold("Moments", 14.0));
             for (i, cut) in plan.cuts.iter().enumerate() {
@@ -1007,10 +1221,16 @@ impl App {
                     ui.painter().circle_filled(dot.center(), 5.0, clip_colour(cut.clip));
                     ui.label(theme::mono(format!("{} to {}", clock(cut.start), clock(cut.end)), 12.5).color(theme::TEXT2));
                     ui.label(theme::mono(format!("{:.0}%", cut.score * 100.0), 12.5).color(if cut.score > 0.7 { theme::OK } else { theme::TEXT3 }));
+                    if theme::small_button(ui, "View").clicked() {
+                        view = Some(i);
+                    }
                     ui.add(egui::Label::new(theme::soft(&cut.why)).truncate());
                 });
             }
         });
+        if let Some(i) = view {
+            self.preview_select(i);
+        }
     }
 
     // -------------------------------------------------------------------- make
@@ -1021,6 +1241,7 @@ impl App {
             ui.label(theme::soft("Choose the shapes and where they are saved."));
         });
         ui.add_space(6.0);
+        self.preview_card(ui);
         let working = self.mon.render.is_some();
         ui.add_enabled_ui(!working, |ui| {
             theme::card(ui, |ui| {
@@ -1076,6 +1297,32 @@ impl App {
         if self.mon.plan.is_none() {
             ui.label(theme::muted("Plan with AI first, on the Plan step."));
         }
+    }
+}
+
+/// The 9:16 picture as the montage will frame it. Follow is shown centred, because it is only worked out while rendering.
+fn paint_phone(ui: &egui::Ui, rect: Rect, tex: &egui::TextureHandle, vertical: Vertical, blur: BlurLayout) {
+    let aspect = tex.size()[0] as f32 / tex.size()[1].max(1) as f32;
+    let radius = egui::CornerRadius::same(16);
+    let draw = |at: Rect, uv: Rect, tint: Color32, r: egui::CornerRadius| {
+        egui::Image::new(egui::load::SizedTexture::new(tex.id(), at.size())).uv(uv).tint(tint).corner_radius(r).paint_at(ui, at);
+    };
+    ui.painter().rect_stroke(rect.expand(3.0), 19, Stroke::new(2.0, theme::LINE_STRONG), egui::StrokeKind::Outside);
+    if vertical == Vertical::Blur {
+        let b = blur.clamped();
+        let cover = ((9.0 / 16.0) / aspect).min(1.0);
+        draw(rect, Rect::from_min_max(pos2(0.5 - cover / 2.0, 0.0), pos2(0.5 + cover / 2.0, 1.0)), Color32::from_gray(70), radius);
+        let (fw, fh) = (rect.width() * b.zoom, rect.width() * b.zoom / aspect);
+        let shown_h = fh.min(rect.height());
+        let top = rect.top() + (rect.height() - shown_h) * b.y;
+        let u_span = (1.0 / b.zoom).min(1.0);
+        let u0 = (1.0 - u_span) * b.x;
+        let _ = fw;
+        draw(Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), shown_h)), Rect::from_min_max(pos2(u0, 0.0), pos2(u0 + u_span, 1.0)), Color32::WHITE, egui::CornerRadius::ZERO);
+    } else {
+        let share = ((9.0 / 16.0) / aspect).min(1.0);
+        let u0 = (1.0 - share) / 2.0;
+        draw(rect, Rect::from_min_max(pos2(u0, 0.0), pos2(u0 + share, 1.0)), Color32::WHITE, radius);
     }
 }
 

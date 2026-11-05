@@ -1049,6 +1049,9 @@ impl eframe::App for App {
         self.refresh_looks(&ctx);
         self.autosave(ctx.input(|i| i.time));
 
+        if self.mode != Mode::Montage || !matches!(self.step, Step::Look | Step::Export) {
+            self.mon.stop_preview();
+        }
         self.shell(ui);
         match (self.mode, self.step) {
             (Mode::Single, Step::Source) if self.source.is_none() => {
