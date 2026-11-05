@@ -3762,6 +3762,7 @@ dependencies = [
  "egui",
  "image",
  "keyring",
+ "pollster 1.0.1",
  "rfd",
  "serde",
  "serde_json",

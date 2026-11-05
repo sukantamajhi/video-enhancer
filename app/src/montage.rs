@@ -409,6 +409,9 @@ pub struct Job<'a> {
     pub sound: Sound,
     pub music: Option<&'a Music>,
     pub out: Out,
+    pub encoder: media::Encoder,
+    /// Where the main picture sits when the 9:16 video uses a blurred background.
+    pub blur: media::BlurLayout,
     pub title: Option<&'a str>,
     pub workdir: &'a Path,
     pub output: &'a Path,
@@ -433,10 +436,7 @@ fn shape_filter(job: &Job, k: usize, cut: &Cut) -> String {
     let p = &job.clips[cut.clip].probe;
     match job.out {
         Out::Wide => "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080".into(),
-        Out::Vertical(Vertical::Blur) => format!(
-            "split[a{k}][b{k}];[a{k}]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=40:2[bg{k}];\
-             [b{k}]scale=1080:-2:flags=lanczos[fg{k}];[bg{k}][fg{k}]overlay=(W-w)/2:(H-h)/2:format=gbrp"
-        ),
+        Out::Vertical(Vertical::Blur) => media::blur_stack(job.blur, &k.to_string()),
         Out::Vertical(mode) => {
             if p.vertical_share() >= 1.0 {
                 "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920".into()
@@ -472,11 +472,14 @@ pub fn build(job: &Job) -> Result<(Vec<String>, String), String> {
     let mut g: Vec<String> = Vec::new();
     for (k, cut) in job.cuts.iter().enumerate() {
         let probe = &job.clips[cut.clip].probe;
+        // The grade runs last, after dropping frames to the output rate and after all cropping, scaling
+        // and blurring (scaling an already graded RGB picture shifts its colours).
         let mut pre = vec!["setpts=PTS-STARTPTS".to_string()];
         pre.extend(media::base_filters(probe));
-        pre.push("format=gbrp".into());
-        pre.push(format!("lut3d=file=lut{}.cube:interp=trilinear", cut.clip));
-        g.push(format!("[{k}:v]{},{},fps={FPS},setsar=1,scale=out_color_matrix=bt709:out_range=tv:flags=lanczos,format=yuv420p,{}[v{k}]", pre.join(","), shape_filter(job, k, cut), media::TAGS));
+        pre.push(format!("fps={FPS}"));
+        let grade = format!("format=gbrp,lut3d=file=lut{}.cube:interp=tetrahedral", cut.clip);
+        let picture = format!("{},{grade}", shape_filter(job, k, cut));
+        g.push(format!("[{k}:v]{},{picture},setsar=1,scale=out_color_matrix=bt709:out_range=tv:flags=lanczos,format=yuv420p,{}[v{k}]", pre.join(","), media::TAGS));
         if job.uses_original() {
             let fades = if job.style.crossfade() { String::new() } else { format!(",afade=t=in:d=0.02,afade=t=out:st={:.3}:d=0.02", (cut.len() - 0.02).max(0.0)) };
             if probe.has_audio {
@@ -550,7 +553,16 @@ pub fn build(job: &Job) -> Result<(Vec<String>, String), String> {
 }
 
 /// Writes one finished montage. It only appears under its real name once complete.
-pub fn render(tools: &Tools, job: &Job, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<(), String> {
+/// Returns the encoder that really did the work: if a graphics-card encoder fails,
+/// the montage is made again on the processor.
+pub fn render(tools: &Tools, job: &Job, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<media::Encoder, String> {
+    match render_once(tools, job, job.encoder, cancel, &mut progress) {
+        Err(e) if e != "Cancelled" && job.encoder != media::Encoder::Cpu => render_once(tools, job, media::Encoder::Cpu, cancel, &mut progress).map(|()| media::Encoder::Cpu),
+        other => other.map(|()| job.encoder),
+    }
+}
+
+fn render_once(tools: &Tools, job: &Job, encoder: media::Encoder, cancel: &AtomicBool, progress: &mut impl FnMut(f32)) -> Result<(), String> {
     let (maps, graph) = build(job)?;
     let script = job.workdir.join("graph.txt");
     std::fs::write(&script, graph).map_err(|e| e.to_string())?;
@@ -561,7 +573,8 @@ pub fn render(tools: &Tools, job: &Job, cancel: &AtomicBool, mut progress: impl 
     let split = maps.iter().position(|a| a == "-map").unwrap_or(maps.len());
     cmd.args(&maps[..split]).args(["-/filter_complex", "graph.txt"]).args(&maps[split..]);
     cmd.args(["-t", &format!("{:.3}", job.total())])
-        .args(["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-profile:v", "high", "-r", &FPS.to_string(), "-g", &FPS.to_string()])
+        .args(media::video_args(encoder, FPS))
+        .args(["-r", &FPS.to_string()])
         .args(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
         .args(["-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-movflags", "+faststart"])
         .arg(&part)
@@ -569,13 +582,26 @@ pub fn render(tools: &Tools, job: &Job, cancel: &AtomicBool, mut progress: impl 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn().map_err(|e| format!("Couldn't start the video tools: {e}"))?;
-    let result = media::watch(child, cancel, job.total(), &mut progress);
+    let result = media::watch(child, cancel, job.total(), progress);
     if result.is_ok() {
         std::fs::rename(&part, job.output).map_err(|e| format!("Couldn't save the finished file: {e}"))?;
     } else {
         std::fs::remove_file(&part).ok();
     }
     result
+}
+
+/// When each moment begins in the finished video, in seconds.
+pub fn segment_starts(cuts: &[Cut], style: Style) -> Vec<f64> {
+    let fade = if style.crossfade() { FADE } else { 0.0 };
+    let mut at = 0.0;
+    cuts.iter()
+        .map(|c| {
+            let start = at;
+            at += c.len() - fade;
+            start
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -635,6 +661,16 @@ mod tests {
             assert!(((c.len() / 0.5) - (c.len() / 0.5).round()).abs() < 1e-6, "{c:?}");
         }
         assert!((cuts.iter().map(Cut::len).sum::<f64>() - 24.0).abs() < 0.5 + 1e-6);
+    }
+
+    #[test]
+    fn chapter_times_follow_the_crossfades() {
+        let cuts = vec![cut(0, 0.0, 4.0, 0.5), cut(0, 10.0, 15.0, 0.5), cut(0, 20.0, 23.0, 0.5)];
+        assert_eq!(segment_starts(&cuts, Style::BeatSync), vec![0.0, 4.0, 9.0]);
+        let faded = segment_starts(&cuts, Style::Highlights);
+        assert_eq!(faded, vec![0.0, 4.0 - FADE, 4.0 - FADE + 5.0 - FADE]);
+        let total = faded[2] + 3.0;
+        assert!((total - (12.0 - 2.0 * FADE)).abs() < 1e-9, "the last moment ends exactly where the video does");
     }
 
     #[test]
@@ -707,7 +743,7 @@ mod tests {
 
         let song = Music { path: song_path, start: beats.first };
         let output = dir.join("beat.mp4");
-        let job = Job { clips: &clips, actions: &[None], cuts: &cuts, style: Style::BeatSync, sound: Sound::MusicAndOriginal, music: Some(&song), out: Out::Vertical(Vertical::Centre), title: None, workdir: &dir, output: &output };
+        let job = Job { clips: &clips, actions: &[None], cuts: &cuts, style: Style::BeatSync, sound: Sound::MusicAndOriginal, music: Some(&song), out: Out::Vertical(Vertical::Centre), encoder: media::Encoder::Cpu, title: None, workdir: &dir, output: &output, blur: media::BlurLayout { zoom: 1.4, x: 0.3, y: 0.5 } };
         render(&tools, &job, &AtomicBool::new(false), |_| {}).unwrap();
         let made = media::probe(&tools, &output).unwrap();
         assert_eq!((made.width, made.height), (1080, 1920));
@@ -766,7 +802,7 @@ mod tests {
         ];
         for (n, (style, sound, out)) in cases.into_iter().enumerate() {
             let output = dir.join(format!("out{n}.mp4"));
-            let job = Job { clips: &clips, actions: &actions, cuts: &cuts, style, sound, music: Some(&song), out, title: Some("My Trip"), workdir: &dir, output: &output };
+            let job = Job { clips: &clips, actions: &actions, cuts: &cuts, style, sound, music: Some(&song), out, encoder: media::Encoder::Cpu, title: Some("My Trip"), workdir: &dir, output: &output, blur: media::BlurLayout { zoom: 1.4, x: 0.3, y: 0.5 } };
             let mut last = 0.0;
             render(&tools, &job, &AtomicBool::new(false), |f| last = f).unwrap_or_else(|e| panic!("{style:?}/{sound:?}/{out:?}: {e}"));
             let made = media::probe(&tools, &output).unwrap();

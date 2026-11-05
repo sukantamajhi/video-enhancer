@@ -85,7 +85,7 @@ impl Look {
 }
 
 /// A look learned by comparing a clip with Gemini Omni's graded version of it.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct LearnedLook {
     pub curves: [Vec<f32>; 3],
     pub saturation: f32,
@@ -208,6 +208,15 @@ impl Lut {
             }
         }
         Self { size, data }
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// The table's colours, red changing fastest, then green, then blue.
+    pub fn entries(&self) -> &[[f32; 3]] {
+        &self.data
     }
 
     /// Writes the table in the standard .cube format, red changing fastest.
@@ -494,6 +503,21 @@ mod tests {
         for i in 0..3 {
             assert!((want[i] - got[i]).abs() < 8.0, "channel {i}: want {want:?}, got {got:?}");
         }
+    }
+
+    /// How fast our own colour table is on 1080p frames: `cargo test lut_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn lut_speed_on_full_hd_frames() {
+        let lut = Lut::build(LUT_SIZE, &Grade { contrast: 0.2, temperature: 0.1, ..Grade::default() }, None);
+        let frame: Vec<u8> = (0..1920 * 1080 * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let began = std::time::Instant::now();
+        let frames = 60;
+        for _ in 0..frames {
+            std::hint::black_box(lut.apply(&frame));
+        }
+        let ms = began.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!("LUTSPEED {ms:.2} ms per 1080p frame = {:.0} frames a second = {:.1}x real time at 60 fps", 1000.0 / ms, 1000.0 / ms / 60.0);
     }
 
     #[test]

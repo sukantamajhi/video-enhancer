@@ -23,6 +23,8 @@ The first time, press **Download video tools** (FFmpeg, about 110 MB, checked ag
 
 API keys are stored in the system credential store (or read from `GEMINI_API_KEY` / `OPENAI_API_KEY`).
 
+**Whole picture on a blurred background (9:16):** the main picture is zoomed in a little by default and centred over a blurred copy of itself. Use the **zoom** slider to make it larger, and drag the small 9:16 preview (or use the sliders in the montage screen) to move it. The crosshair marks the middle of the main picture, **Centre** puts it back, and the preview matches the exported video. The choice is remembered per video.
+
 ## Montage (several clips into one video)
 
 Switch to **Montage** at the top, then add up to 12 clips (for example five 2-minute clips).
@@ -40,6 +42,37 @@ Notes:
 - ccMixter is a small community server: searches take 5-15 seconds, and a failed search can simply be retried with **Search again**.
 - The story title needs a system font (Arial on Windows); without one the title is skipped.
 - Pasting a YouTube link to rip music is deliberately not supported: it breaks YouTube's terms and can't make a track safe to use.
+
+## Upload pack (titles, description, hashtags, thumbnail)
+
+Press **Write my upload pack** under Export (single video) or at the bottom of the Montage screen.
+
+- **Three title options** (each under 100 characters, editable, with a character count), a **description intro**, and **3-5 hashtags**. Sends about 8 small pictures to OpenAI, never your video files.
+- **Chapters are computed by the app, not the AI.** Each chapter time is where that moment really sits in the finished video (for a montage, after crossfades and beat-snapping). The AI only supplies short titles. The list follows YouTube's rules (starts at 0:00, at least 3 chapters, 10 seconds apart, at most 15) and is left out entirely if the video is too short to qualify.
+- The description also carries the **music credit line** when the song asks for one, and the hashtags.
+- **Thumbnail:** the AI picks the clearest frame and 1-3 words of text. The app draws a 1280x720 JPEG from your footage in the same colour grade as the video, with bold outlined text (Impact, when the computer has it). Change the text, or step through the other candidate frames, and press **Redraw**.
+- **Save pack and thumbnail to the folder** writes `..._upload_pack.txt` and `..._thumbnail.jpg`. The AI answer is cached like the others, so asking again with nothing changed costs nothing.
+
+## Faster exports (graphics card)
+
+Two separate things use the graphics card, and both are on by default when your computer supports them (**Single video** export panel):
+
+- **Encoder** (NVIDIA NVENC, AMD AMF, Intel Quick Sync): the menu lists only encoders that really work on your computer. If one ever fails, the same video is made on the CPU and the message says so. Graphics-card files come out somewhat larger for the same quality (SSIM against the CPU encode is within 0.0001).
+- **Grade colour on the graphics card:** FFmpeg's colour-table filter is the slowest part of an export, so the graphics card applies the colour grade instead. The export is split in three programs running side by side: FFmpeg decodes, crops and scales; the card grades every frame; a second FFmpeg adds the original sound and encodes. The card uses the same colour table and the same arithmetic as the preview. At start-up it is checked against the processor on a test picture (it must agree to within one brightness level) and if it isn't accurate, or isn't there, FFmpeg grades as before.
+
+Measured end to end on a 16-thread PC with an NVIDIA RTX 3060, on 60 s of 1080p60 test footage (real gameplay will differ):
+
+| | colour by FFmpeg | colour on the graphics card |
+|---|---|---|
+| 16:9, CPU encoder | 1.8x real time | 2.6x |
+| 16:9, NVIDIA encoder | 2.4x | **5.3x** |
+| 9:16, NVIDIA encoder | 2.2x | **4.6x** |
+
+Before any of these changes it was about 1.2x. At 5x, a 2-hour 1080p60 session takes roughly 25 minutes to export, not "minutes".
+
+What limits it now is not the graphics card (grading takes under 1 ms a frame) but the cost of moving every raw frame between the three programs: about 11 GB/s of memory copying on this PC. Going further would mean keeping frames on the graphics card the whole way, from decoder to encoder, which is not built. 4K takes four times the data. Two cases still use FFmpeg for colour: **montages** (their graph joins many clips) and any picture size whose width isn't a multiple of 8.
+
+Other notes: sharpening is **off by default** (it adds roughly 40% to FFmpeg's work); and the colour grade now always runs after cropping, scaling and blurring, because scaling an already graded picture shifted its colours.
 
 ## Your work is remembered (so AI results are never paid for twice)
 

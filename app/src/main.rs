@@ -1,11 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod gpu;
 mod grade;
 mod media;
 mod montage;
 mod montage_ui;
 mod music;
+mod pack;
+mod pack_ui;
 mod sample;
 mod store;
 
@@ -17,7 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use eframe::egui::{self, Color32, RichText, pos2, vec2};
 use grade::{Grade, LOOKS, LUT_SIZE, LearnedLook, Lut};
 use serde::{Deserialize, Serialize};
-use media::{ExportJob, Finish, Frame, Framing, GrabOptions, Player, Probe, Shape, Tools};
+use media::{BlurLayout, Encoder, EncoderChoice, ExportJob, Finish, Frame, Framing, GrabOptions, Player, Probe, Shape, Tools};
 
 /// What a background thread can tell the window.
 enum Msg {
@@ -34,6 +37,22 @@ enum Msg {
     Export(f32, String),
     ExportDone(Result<Vec<PathBuf>, String>),
     Montage(montage_ui::Event),
+    Encoders(Vec<Encoder>),
+    /// The graphics card's name, or why it can't be used for colour grading.
+    Gpu(Result<String, String>),
+    EncodeInfo(String),
+    Pack(pack_ui::Event),
+}
+
+/// How the finished video was made, for the message that follows an export.
+fn encode_summary(seconds: u64, used: Encoder, fell_back: bool, colour_on_card: bool) -> String {
+    let time = format!("{}:{:02}", seconds / 60, seconds % 60);
+    let colour = if colour_on_card { ", with the colour grade done on the graphics card" } else { "" };
+    if fell_back {
+        format!(" Made in {time} on the CPU (the graphics-card encoder didn't work, so the CPU was used instead){colour}.")
+    } else {
+        format!(" Made in {time} with {}{colour}.", used.short())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -87,6 +106,10 @@ struct VideoSession {
     framing: VerticalFraming,
     manual_x: f32,
     action: Option<Vec<(f64, f32)>>,
+    #[serde(default)]
+    blur: BlurLayout,
+    #[serde(default)]
+    pack: Option<pack::Pack>,
 }
 
 /// Choices that carry over from one run to the next.
@@ -104,6 +127,8 @@ struct Settings {
     wants_lut: bool,
     wants_thumb: bool,
     out_dir: Option<PathBuf>,
+    encoder: EncoderChoice,
+    gpu_grade: bool,
 }
 
 impl Default for Settings {
@@ -120,6 +145,8 @@ impl Default for Settings {
             wants_lut: false,
             wants_thumb: true,
             out_dir: None,
+            encoder: EncoderChoice::Auto,
+            gpu_grade: true,
         }
     }
 }
@@ -193,14 +220,23 @@ struct App {
     mode: Mode,
     mon: montage_ui::State,
     video_fp: Option<String>,
+    pack1: pack_ui::PackState,
+    encoders: Vec<Encoder>,
+    encoder_choice: EncoderChoice,
+    gpu_grade: bool,
+    gpu_status: Option<Result<String, String>>,
+    encode_info: String,
+    blur: BlurLayout,
     reuse_ai: bool,
     last_save: f64,
     saved: [String; 3],
 }
 
 fn main() -> eframe::Result {
+    // VE_SIZE=1360x1500 gives a taller window, so a long screen fits in one screenshot.
+    let size: [f32; 2] = std::env::var("VE_SIZE").ok().and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))).unwrap_or([1360.0, 860.0]);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1360.0, 860.0]).with_min_inner_size([1000.0, 640.0]).with_title("Video Enhancer").with_drag_and_drop(true),
+        viewport: egui::ViewportBuilder::default().with_inner_size(size).with_min_inner_size([1000.0, 640.0]).with_title("Video Enhancer").with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native("Video Enhancer", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
@@ -277,6 +313,13 @@ impl App {
             mode: if std::env::var_os("VE_MONTAGE").is_some() { Mode::Montage } else { Mode::Single },
             mon: montage_ui::State::new(),
             video_fp: None,
+            pack1: pack_ui::PackState::default(),
+            encoders: Vec::new(),
+            encoder_choice: EncoderChoice::Auto,
+            gpu_grade: true,
+            gpu_status: None,
+            encode_info: String::new(),
+            blur: BlurLayout::default(),
             reuse_ai: true,
             last_save: 0.0,
             saved: Default::default(),
@@ -291,7 +334,22 @@ impl App {
             app.shot = Some((path.into(), n.parse().unwrap_or(12)));
         }
         app.restore();
+        app.detect_encoders();
+        app.detect_gpu();
         app
+    }
+
+    /// Checks in the background which graphics-card encoders really work on this computer.
+    fn detect_encoders(&mut self) {
+        let Some(tools) = self.tools.clone() else { return };
+        let mail = self.mail.clone();
+        std::thread::spawn(move || mail.send(Msg::Encoders(media::detect_encoders(&tools))));
+    }
+
+    /// Starts the graphics card and checks its colours against the processor's, in the background.
+    fn detect_gpu(&mut self) {
+        let mail = self.mail.clone();
+        std::thread::spawn(move || mail.send(Msg::Gpu(gpu::shared().map(|g| g.name().to_string()))));
     }
 
     // ------------------------------------------------------------------ memory
@@ -309,6 +367,8 @@ impl App {
             wants_lut: self.wants_lut,
             wants_thumb: self.wants_thumb,
             out_dir: self.out_dir.clone(),
+            encoder: self.encoder_choice,
+            gpu_grade: self.gpu_grade,
         }
     }
 
@@ -326,6 +386,8 @@ impl App {
             framing: self.framing,
             manual_x: self.manual_x,
             action: self.action.clone(),
+            blur: self.blur,
+            pack: self.pack1.pack.clone(),
         })
     }
 
@@ -341,6 +403,8 @@ impl App {
             self.wants_lut = s.wants_lut;
             self.wants_thumb = s.wants_thumb;
             self.out_dir = s.out_dir.filter(|d| d.is_dir());
+            self.encoder_choice = s.encoder;
+            self.gpu_grade = s.gpu_grade;
             if std::env::var_os("VE_MONTAGE").is_none() && s.montage {
                 self.mode = Mode::Montage;
             }
@@ -560,7 +624,7 @@ impl App {
         let framing = match self.framing {
             VerticalFraming::Centre => Some(Framing::Position(0.5)),
             VerticalFraming::Manual => Some(Framing::Position(self.manual_x)),
-            VerticalFraming::Blur => Some(Framing::Blur),
+            VerticalFraming::Blur => Some(Framing::Blur(self.blur.clamped())),
             VerticalFraming::Follow => self.action.clone().map(Framing::Follow),
         };
         let follow_needed = self.wants_vertical && self.framing == VerticalFraming::Follow && framing.is_none();
@@ -570,9 +634,12 @@ impl App {
             return;
         }
         let (cancel, mail, thumb_t) = (Arc::new(AtomicBool::new(false)), self.mail.clone(), self.t);
+        let encoder = self.encoder_choice.resolve(&self.encoders);
+        let on_card = self.gpu_grade && matches!(self.gpu_status, Some(Ok(_)));
         self.export = Some(ExportState { progress: 0.0, label: "Getting ready…".into(), cancel: cancel.clone() });
         self.made.clear();
         std::thread::spawn(move || {
+            let began = std::time::Instant::now();
             let work = std::env::temp_dir().join(format!("video-enhancer-export-{}", std::process::id()));
             let result = (|| -> Result<Vec<PathBuf>, String> {
                 std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
@@ -592,11 +659,19 @@ impl App {
                 }
                 let mut made = Vec::new();
                 let steps = jobs.len().max(1) as f32;
+                let mut fell_back = false;
+                let mut on_card_used = false;
+                let had_jobs = !jobs.is_empty();
                 for (i, (label, shape, output)) in jobs.into_iter().enumerate() {
-                    let job = ExportJob { input: input.clone(), probe: probe.clone(), start, end, shape, finish, lut_file: "look.cube".into(), workdir: work.clone(), output: output.clone() };
+                    let job = ExportJob { input: input.clone(), probe: probe.clone(), start, end, shape, finish, lut_file: "look.cube".into(), workdir: work.clone(), output: output.clone(), encoder, gpu_lut: on_card.then(|| Arc::new(lut.clone())) };
                     let name = label.clone();
-                    media::export(&tools, &job, &cancel, |f| mail.send(Msg::Export((i as f32 + f) / steps, format!("Making the {name}…"))))?;
+                    let used = media::export(&tools, &job, &cancel, |f| mail.send(Msg::Export((i as f32 + f) / steps, format!("Making the {name} ({})…", encoder.short()))))?;
+                    fell_back |= used.encoder != encoder;
+                    on_card_used |= used.gpu_grade;
                     made.push(output);
+                }
+                if had_jobs {
+                    mail.send(Msg::EncodeInfo(encode_summary(began.elapsed().as_secs(), encoder, fell_back, on_card_used)));
                 }
                 if cube {
                     let target = media::free_name(&out_dir, &stem, "_look", "cube");
@@ -629,6 +704,7 @@ impl App {
                 match result {
                     Ok(tools) => {
                         self.tools = Some(tools);
+                        self.detect_encoders();
                         self.note("Video tools are ready. Open a video to begin.");
                     }
                     Err(e) => self.fail(e),
@@ -654,6 +730,8 @@ impl App {
                         self.t = s.t.clamp(0.0, probe.duration);
                         (self.grade, self.auto_base, self.learned, self.look) = (s.grade, s.auto_base, s.learned, s.look);
                         (self.finish, self.ai_result, self.framing, self.manual_x, self.action) = (s.finish, s.ai_result, s.framing, s.manual_x, s.action);
+                        self.blur = s.blur.clamped();
+                        self.pack1 = pack_ui::PackState::with(s.pack);
                     }
                     None => {
                         self.t = probe.duration * 0.1;
@@ -662,6 +740,7 @@ impl App {
                         self.learned = None;
                         self.look = Some(0);
                         self.ai_result.clear();
+                        self.pack1 = pack_ui::PackState::default();
                     }
                 }
                 let message = format!("{}  {}x{}  {}  {:.0} fps", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()), probe.width, probe.height, clock(probe.duration), probe.fps);
@@ -737,12 +816,17 @@ impl App {
                     e.label = label;
                 }
             }
+            Msg::Encoders(found) => self.encoders = found,
+            Msg::Gpu(result) => self.gpu_status = Some(result),
+            Msg::EncodeInfo(text) => self.encode_info = text,
+            Msg::Pack(event) => self.pack_event(event),
             Msg::Montage(event) => self.montage_event(event),
             Msg::ExportDone(result) => {
                 self.export = None;
                 match result {
                     Ok(files) => {
-                        self.note(format!("Finished. {} file(s) saved.", files.len()));
+                        let how = std::mem::take(&mut self.encode_info);
+                        self.note(format!("Finished. {} file(s) saved.{how}", files.len()));
                         self.made = files;
                     }
                     Err(e) if e == "Cancelled" => self.note("Export cancelled. Nothing half-finished was left behind."),
@@ -975,7 +1059,7 @@ impl App {
             }
         });
         egui::CollapsingHeader::new("Finishing (applied when you export)").default_open(false).show(ui, |ui| {
-            Self::slider(ui, &mut self.finish.sharpen, 0.0..=1.0, "Sharpen");
+            Self::slider(ui, &mut self.finish.sharpen, 0.0..=1.0, "Sharpen (slower export)");
             Self::slider(ui, &mut self.finish.denoise, 0.0..=1.0, "Noise cleanup");
             ui.checkbox(&mut self.finish.loudness, "Even out the sound (YouTube level)");
         });
@@ -1053,6 +1137,91 @@ impl App {
         });
     }
 
+    /// Zoom and position of the main picture over the blurred background, with a
+    /// live 9:16 preview. Drag the preview to move the picture.
+    fn blur_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Main picture").weak().small());
+        ui.add(egui::Slider::new(&mut self.blur.zoom, 1.0..=2.0).text("zoom").fixed_decimals(2));
+        let Some(tex) = self.after_tex.clone() else { return };
+        let aspect = tex.size()[0] as f32 / tex.size()[1].max(1) as f32;
+        let width = 150.0f32.min(ui.available_width());
+        let (rect, response) = ui.allocate_exact_size(vec2(width, width * 16.0 / 9.0), egui::Sense::click_and_drag());
+        let b = &mut self.blur;
+        let (fw, fh) = (rect.width() * b.zoom, rect.width() * b.zoom / aspect);
+        if response.dragged() {
+            // Dragging the picture one way shows more of the other side of it.
+            let d = response.drag_delta();
+            if fw > rect.width() + 0.5 {
+                b.x = (b.x - d.x / (fw - rect.width())).clamp(0.0, 1.0);
+            }
+            if fh < rect.height() - 0.5 {
+                b.y = (b.y + d.y / (rect.height() - fh)).clamp(0.0, 1.0);
+            }
+        }
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, Color32::BLACK);
+        // The background is the same picture filling the frame, dimmed like the blur.
+        let cover = ((9.0 / 16.0) / aspect).min(1.0);
+        let uv = egui::Rect::from_min_max(pos2(0.5 - cover / 2.0, 0.0), pos2(0.5 + cover / 2.0, 1.0));
+        painter.image(tex.id(), rect, uv, Color32::from_gray(80));
+        let left = rect.left() - (fw - rect.width()) * b.x;
+        let top = if fh > rect.height() { rect.top() - (fh - rect.height()) * 0.5 } else { rect.top() + (rect.height() - fh) * b.y };
+        let picture = egui::Rect::from_min_size(pos2(left, top), vec2(fw, fh));
+        painter.image(tex.id(), picture, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        // A crosshair on the middle of the main picture.
+        let centre = picture.intersect(rect).center();
+        for colour_width in [(Color32::BLACK, 3.0), (Color32::WHITE, 1.2)] {
+            let stroke = egui::Stroke::new(colour_width.1, colour_width.0);
+            painter.line_segment([centre - vec2(9.0, 0.0), centre + vec2(9.0, 0.0)], stroke);
+            painter.line_segment([centre - vec2(0.0, 9.0), centre + vec2(0.0, 9.0)], stroke);
+        }
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Color32::from_gray(120)), egui::StrokeKind::Inside);
+        ui.horizontal(|ui| {
+            if ui.small_button("Centre").on_hover_text("Put the picture back in the middle").clicked() {
+                self.blur.x = 0.5;
+                self.blur.y = 0.5;
+            }
+            if ui.small_button("Reset zoom").clicked() {
+                self.blur = BlurLayout::default();
+            }
+        });
+        ui.label(RichText::new("Drag the preview to move the picture.").weak().small());
+    }
+
+    /// Which encoder writes the finished video. Shared by both screens.
+    pub fn encoder_picker(&mut self, ui: &mut egui::Ui, show_grade: bool) {
+        let using = self.encoder_choice.resolve(&self.encoders);
+        let automatic = format!("Automatic ({})", using.short());
+        ui.horizontal(|ui| {
+            ui.label("Encoder");
+            let shown = match self.encoder_choice {
+                EncoderChoice::Auto => automatic.clone(),
+                _ => using.name().to_string(),
+            };
+            egui::ComboBox::from_id_salt("encoder").selected_text(shown).width(200.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.encoder_choice, EncoderChoice::Auto, automatic);
+                ui.selectable_value(&mut self.encoder_choice, EncoderChoice::Cpu, Encoder::Cpu.name());
+                for (choice, encoder) in [(EncoderChoice::Nvidia, Encoder::Nvidia), (EncoderChoice::Amd, Encoder::Amd), (EncoderChoice::Intel, Encoder::Intel)] {
+                    if self.encoders.contains(&encoder) {
+                        ui.selectable_value(&mut self.encoder_choice, choice, encoder.name());
+                    }
+                }
+            });
+        });
+        ui.label(RichText::new(if self.encoders.is_empty() { "No graphics-card encoder found here, so the CPU is used." } else { "Graphics-card encoding is much faster. Files come out slightly larger." }).weak().small());
+        if show_grade {
+            let ready = matches!(self.gpu_status, Some(Ok(_)));
+            ui.add_enabled(ready, egui::Checkbox::new(&mut self.gpu_grade, "Grade colour on the graphics card"))
+                .on_hover_text("Much faster than the processor, and identical to the preview. Single-video exports only for now; montages still grade with FFmpeg.");
+            let status = match &self.gpu_status {
+                None => "Checking the graphics card…".to_string(),
+                Some(Ok(name)) => format!("Colour grading on: {name}"),
+                Some(Err(why)) => format!("Not available here, so FFmpeg grades the colour: {why}"),
+            };
+            ui.label(RichText::new(status).weak().small());
+        }
+    }
+
     fn export_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Export");
         let have = self.source.is_some();
@@ -1084,6 +1253,9 @@ impl App {
                     ui.radio_value(&mut self.framing, VerticalFraming::Blur, "Whole picture on a blurred background");
                     if self.framing == VerticalFraming::Manual {
                         ui.add(egui::Slider::new(&mut self.manual_x, 0.0..=1.0).text("left to right").show_value(false));
+                    }
+                    if self.framing == VerticalFraming::Blur {
+                        self.blur_controls(ui);
                     }
                     if self.framing == VerticalFraming::Follow {
                         if self.action_busy {
@@ -1118,6 +1290,8 @@ impl App {
         {
             self.out_dir = Some(dir);
         }
+        ui.add_space(4.0);
+        self.encoder_picker(ui, true);
         ui.add_space(6.0);
         if let Some(state) = &self.export {
             ui.label(&state.label);
@@ -1146,6 +1320,9 @@ impl App {
                 let _ = std::process::Command::new(program).arg(parent).spawn();
             }
         }
+
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Upload pack (titles, description, thumbnail)").default_open(self.pack1.pack.is_some()).show(ui, |ui| self.pack_ui(ui, pack_ui::Target::Single));
 
         if let Some(scope) = &self.scope {
             ui.add_space(10.0);
@@ -1304,7 +1481,7 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
-        if self.player.is_some() || self.ai_busy.is_some() || self.export.is_some() || self.mon.working() {
+        if self.player.is_some() || self.ai_busy.is_some() || self.export.is_some() || self.mon.working() || self.pack1.working() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

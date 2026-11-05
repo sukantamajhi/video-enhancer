@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::grade::{self, Grade, LearnedLook};
 use crate::media::{self, Frame, GrabOptions, Tools};
 use crate::montage::{Cut, Style};
+use crate::pack::{self, Segment};
 
 pub const GEMINI_MODEL: &str = "gemini-omni-1.1-flash";
 pub const OPENAI_MODELS: [(&str, &str); 3] = [
@@ -403,8 +404,159 @@ pub fn openai_plan(key: &str, model: &str, clips: &[ClipBrief], style: Style, ta
     parse_plan(&parsed)
 }
 
+// ------------------------------------------------------------ upload-ready pack
+
+/// What the AI wrote for the video's page. The chapter times are not here on
+/// purpose: the app knows where each moment really is, so it supplies them.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AiPack {
+    pub titles: Vec<String>,
+    pub intro: String,
+    /// (moment number, short chapter title)
+    pub chapter_titles: Vec<(usize, String)>,
+    pub hashtags: Vec<String>,
+    pub thumb_candidate: usize,
+    pub thumb_text: String,
+    pub reason: String,
+}
+
+pub struct PackRequest<'a> {
+    pub kind: &'a str,
+    pub duration: f64,
+    pub notes: &'a str,
+    pub segments: &'a [Segment],
+    /// Candidate thumbnail frames, each with a label that says where it is from.
+    pub frames: &'a [(String, Frame)],
+}
+
+fn pack_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "titles": { "type": "array", "items": { "type": "string" }, "description": "Exactly three different title options, each under 70 characters, hooky but honest, no quotation marks" },
+            "intro": { "type": "string", "description": "Two or three plain sentences for the top of the description. No timestamps, no hashtags, no links" },
+            "chapter_titles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "segment": { "type": "integer", "description": "The moment number, as given" },
+                        "title": { "type": "string", "description": "A chapter title of two to five words" },
+                    },
+                    "required": ["segment", "title"],
+                    "additionalProperties": false,
+                },
+            },
+            "hashtags": { "type": "array", "items": { "type": "string" }, "description": "Three to five hashtags without the # sign, no spaces" },
+            "thumbnail": {
+                "type": "object",
+                "properties": {
+                    "candidate": { "type": "integer", "description": "The candidate frame number with the clearest action or strongest emotion" },
+                    "text": { "type": "string", "description": "One to three words in capitals to print on the thumbnail, for example INSANE CLUTCH" },
+                    "reason": { "type": "string", "description": "One short sentence on why this frame" },
+                },
+                "required": ["candidate", "text", "reason"],
+                "additionalProperties": false,
+            },
+        },
+        "required": ["titles", "intro", "chapter_titles", "hashtags", "thumbnail"],
+        "additionalProperties": false,
+    })
+}
+
+fn parse_pack(parsed: &Value) -> Result<AiPack, String> {
+    let strings = |field: &str| -> Vec<String> { parsed[field].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect() };
+    let chapter_titles: Vec<(usize, String)> = parsed["chapter_titles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some((c["segment"].as_u64()? as usize, c["title"].as_str()?.to_string())))
+        .collect();
+    let thumb = &parsed["thumbnail"];
+    Ok(AiPack {
+        titles: strings("titles"),
+        intro: parsed["intro"].as_str().unwrap_or("").to_string(),
+        chapter_titles,
+        hashtags: strings("hashtags"),
+        thumb_candidate: thumb["candidate"].as_u64().unwrap_or(0) as usize,
+        thumb_text: thumb["text"].as_str().unwrap_or("").to_string(),
+        reason: thumb["reason"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// Shows the AI the video's moments and a few candidate frames, and gets back the titles,
+/// description text, hashtags and thumbnail choice.
+pub fn openai_pack(key: &str, model: &str, req: &PackRequest) -> Result<AiPack, String> {
+    let moments: Vec<String> = req
+        .segments
+        .iter()
+        .enumerate()
+        .take(40)
+        .map(|(i, s)| if s.note.trim().is_empty() { format!("{i}: at {}", pack::stamp(s.at)) } else { format!("{i}: at {}, {}", pack::stamp(s.at), s.note.trim()) })
+        .collect();
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": format!(
+            "You package YouTube gaming videos for creators. This video is {}, {} long. {}\n\
+             Moments in the video, in order (number: time, what happens):\n{}\n\n\
+             Write the title options, the description intro, a short chapter title for each moment number above, the hashtags, \
+             and choose the thumbnail from the candidate frames that follow. Be specific to what the footage shows. \
+             Do not invent game names, scores or facts you cannot see or were not told.",
+            req.kind,
+            pack::stamp(req.duration),
+            if req.notes.trim().is_empty() { String::new() } else { format!("The creator says: {}.", req.notes.trim()) },
+            moments.join("\n"),
+        ),
+    })];
+    for (i, (label, frame)) in req.frames.iter().enumerate() {
+        content.push(json!({ "type": "input_text", "text": format!("Candidate frame {i}: {label}") }));
+        content.push(json!({ "type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", STANDARD.encode(encode_jpeg(frame, 80)?)), "detail": "low" }));
+    }
+    let body = json!({
+        "model": model,
+        "input": [{ "role": "user", "content": content }],
+        "text": { "format": { "type": "json_schema", "name": "upload_pack", "strict": true, "schema": pack_schema() } },
+    });
+    let reply = post_json("https://api.openai.com/v1/responses", &[("authorization", format!("Bearer {key}"))], &body, 240)?;
+    let parsed: Value = serde_json::from_str(&openai_text(&reply)?).map_err(|e| format!("The answer wasn't valid: {e}"))?;
+    parse_pack(&parsed)
+}
+
 #[cfg(test)]
 mod tests {
+    /// OpenAI's strict mode needs every property listed as required, at every level.
+    fn assert_strict(schema: &Value) {
+        if let Some(props) = schema["properties"].as_object() {
+            let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
+            let mut required: Vec<&str> = schema["required"].as_array().expect("required list").iter().map(|v| v.as_str().unwrap()).collect();
+            names.sort();
+            required.sort();
+            assert_eq!(names, required, "every property must be required");
+            assert_eq!(schema["additionalProperties"], false);
+            props.values().for_each(assert_strict);
+        }
+        if schema["type"] == "array" {
+            assert_strict(&schema["items"]);
+        }
+    }
+
+    #[test]
+    fn pack_schema_is_strict_at_every_level() {
+        assert_strict(&pack_schema());
+    }
+
+    #[test]
+    fn the_pack_answer_is_read_and_tolerates_gaps() {
+        let ai = parse_pack(&json!({
+            "titles": ["One", "Two", "Three"], "intro": "Hi.",
+            "chapter_titles": [{ "segment": 0, "title": "Start" }, { "segment": "x", "title": "bad" }, { "segment": 3, "title": "Boss" }],
+            "hashtags": ["gaming"], "thumbnail": { "candidate": 2, "text": "WOW", "reason": "action" },
+        })).unwrap();
+        assert_eq!((ai.titles.len(), ai.chapter_titles.clone(), ai.thumb_candidate, ai.thumb_text.as_str()), (3, vec![(0, "Start".to_string()), (3, "Boss".to_string())], 2, "WOW"));
+        let empty = parse_pack(&json!({})).unwrap();
+        assert!(empty.titles.is_empty() && empty.chapter_titles.is_empty());
+    }
+
     #[test]
     fn plan_schema_is_strict_and_complete() {
         let s = plan_schema();

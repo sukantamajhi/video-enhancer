@@ -214,7 +214,7 @@ pub struct Finish {
 
 impl Default for Finish {
     fn default() -> Self {
-        Self { sharpen: 0.2, denoise: 0.0, loudness: true }
+        Self { sharpen: 0.0, denoise: 0.0, loudness: true }
     }
 }
 
@@ -241,7 +241,7 @@ fn denoise_filter(f: Finish) -> Option<String> {
     })
 }
 
-fn sharpen_filter(f: Finish) -> Option<String> {
+pub fn sharpen_filter(f: Finish) -> Option<String> {
     (f.sharpen > 0.01).then(|| format!("unsharp=5:5:{:.2}:5:5:0", f.sharpen as f64 * 1.2))
 }
 
@@ -483,11 +483,48 @@ pub fn action_expression(points: &[(f64, f32)], start: f64) -> String {
     format!("(in_w-out_w)*({})", terms.join("+"))
 }
 
+/// How the main picture sits on the blurred background of a 9:16 video.
+/// Everything is centred by default, with the picture zoomed in a little.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BlurLayout {
+    /// 1.0 shows the whole width; larger zooms in (and trims the sides).
+    pub zoom: f32,
+    /// Which part of a zoomed picture is shown, 0 = left edge, 1 = right edge.
+    pub x: f32,
+    /// Where the picture sits between the top and bottom of the frame.
+    pub y: f32,
+}
+
+impl Default for BlurLayout {
+    fn default() -> Self {
+        Self { zoom: 1.2, x: 0.5, y: 0.5 }
+    }
+}
+
+impl BlurLayout {
+    pub fn clamped(self) -> Self {
+        Self { zoom: self.zoom.clamp(1.0, 2.5), x: self.x.clamp(0.0, 1.0), y: self.y.clamp(0.0, 1.0) }
+    }
+}
+
+/// The filters that put the main picture over its own blurred copy. `k` keeps
+/// the labels unique when several of these sit in one graph.
+pub fn blur_stack(layout: BlurLayout, k: &str) -> String {
+    let l = layout.clamped();
+    let width = even(1080.0 * l.zoom as f64);
+    format!(
+        "split[a{k}][b{k}];[a{k}]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=40:2[bg{k}];\
+         [b{k}]scale={width}:-2:flags=lanczos,crop='min(iw,1080)':'min(ih,1920)':'(iw-out_w)*{:.4}':'(ih-out_h)*0.5'[fg{k}];\
+         [bg{k}][fg{k}]overlay=0:'(H-h)*{:.4}':format=gbrp",
+        l.x, l.y
+    )
+}
+
 #[derive(Clone)]
 pub enum Framing {
     Position(f32),
     Follow(Vec<(f64, f32)>),
-    Blur,
+    Blur(BlurLayout),
 }
 
 #[derive(Clone)]
@@ -508,32 +545,135 @@ pub struct ExportJob {
     pub lut_file: String,
     pub workdir: PathBuf,
     pub output: PathBuf,
+    pub encoder: Encoder,
+    /// When set, the colour grade is done on the graphics card with this table instead of in FFmpeg.
+    pub gpu_lut: Option<Arc<crate::grade::Lut>>,
+}
+
+/// What really made a finished video.
+#[derive(Clone, Copy, Debug)]
+pub struct Made {
+    pub encoder: Encoder,
+    pub gpu_grade: bool,
 }
 
 pub const TAGS: &str = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv";
 
+/// What writes the finished video: the processor, or the graphics card's own video chip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Encoder {
+    Cpu,
+    Nvidia,
+    Amd,
+    Intel,
+}
+
+impl Encoder {
+    pub const HARDWARE: [Encoder; 3] = [Encoder::Nvidia, Encoder::Amd, Encoder::Intel];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Encoder::Cpu => "CPU (best quality for the size, slowest)",
+            Encoder::Nvidia => "NVIDIA GPU (NVENC)",
+            Encoder::Amd => "AMD GPU (AMF)",
+            Encoder::Intel => "Intel GPU (Quick Sync)",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Encoder::Cpu => "CPU",
+            Encoder::Nvidia => "NVIDIA GPU",
+            Encoder::Amd => "AMD GPU",
+            Encoder::Intel => "Intel GPU",
+        }
+    }
+
+    fn codec(self) -> &'static str {
+        match self {
+            Encoder::Cpu => "libx264",
+            Encoder::Nvidia => "h264_nvenc",
+            Encoder::Amd => "h264_amf",
+            Encoder::Intel => "h264_qsv",
+        }
+    }
+}
+
+/// What the person picked. Automatic uses the first graphics card that works.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum EncoderChoice {
+    #[default]
+    Auto,
+    Cpu,
+    Nvidia,
+    Amd,
+    Intel,
+}
+
+impl EncoderChoice {
+    /// The encoder to use, given which ones really work on this computer.
+    pub fn resolve(self, available: &[Encoder]) -> Encoder {
+        let wanted = match self {
+            EncoderChoice::Auto => Encoder::HARDWARE.into_iter().find(|e| available.contains(e)),
+            EncoderChoice::Cpu => None,
+            EncoderChoice::Nvidia => Some(Encoder::Nvidia),
+            EncoderChoice::Amd => Some(Encoder::Amd),
+            EncoderChoice::Intel => Some(Encoder::Intel),
+        };
+        wanted.filter(|e| available.contains(e)).unwrap_or(Encoder::Cpu)
+    }
+}
+
+/// Which graphics-card encoders really work here. Each is tried on a tiny test
+/// picture, because FFmpeg lists an encoder even on a computer without that card.
+pub fn detect_encoders(tools: &Tools) -> Vec<Encoder> {
+    Encoder::HARDWARE
+        .into_iter()
+        .filter(|e| {
+            hidden(&tools.ffmpeg)
+                .args(["-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=0.4", "-pix_fmt", "yuv420p", "-c:v", e.codec(), "-f", "null", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+        .collect()
+}
+
+/// The video settings for each encoder, tuned for near-identical quality.
+/// Graphics-card encoders are much faster but make slightly larger files.
+pub fn video_args(encoder: Encoder, gop: u32) -> Vec<String> {
+    let gop = gop.max(1).to_string();
+    let list: &[&str] = match encoder {
+        Encoder::Cpu => &["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-profile:v", "high", "-bf", "2", "-flags", "+cgop", "-g"],
+        Encoder::Nvidia => &["-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", "19", "-b:v", "0", "-spatial-aq", "1", "-profile:v", "high", "-bf", "2", "-g"],
+        Encoder::Amd => &["-c:v", "h264_amf", "-usage", "high_quality", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-qp_b", "22", "-profile:v", "high", "-g"],
+        Encoder::Intel => &["-c:v", "h264_qsv", "-preset", "slower", "-global_quality", "19", "-profile:v", "high", "-g"],
+    };
+    list.iter().map(|a| a.to_string()).chain([gop]).collect()
+}
+
 fn export_graph(job: &ExportJob) -> String {
     let p = &job.probe;
-    let mut chain = base_filters(p);
-    chain.extend(denoise_filter(job.finish));
-    chain.push("format=gbrp".into());
-    chain.push(format!("lut3d=file={}:interp=trilinear", job.lut_file));
-    chain.extend(sharpen_filter(job.finish));
-    let graded = chain.join(",");
-    let finish_to = |w: u32, h: u32| format!("scale={w}:{h}:flags=lanczos:out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAGS}");
+    // The colour grade is the most expensive step, so it runs last, on the final picture.
+    // It must run last: scaling or blurring an already graded (RGB) picture shifts its colours.
+    let mut pre = base_filters(p);
+    pre.extend(denoise_filter(job.finish));
+    let lead = if pre.is_empty() { "[0:v]".to_string() } else { format!("[0:v]{},", pre.join(",")) };
+    let grade = format!("format=gbrp,lut3d=file={}:interp=tetrahedral", job.lut_file);
+    // Back to video colour. Sharpening works on the brightness picture only, after the conversion.
+    let finish = format!("scale=out_color_matrix=bt709:out_range=tv:flags=lanczos,format=yuv420p,{TAGS}{}", sharpen_filter(job.finish).map_or(String::new(), |s| format!(",{s}")));
     let (w, h) = (p.width as f64, p.height as f64);
     match &job.shape {
         Shape::Wide { height } => {
             let th = if *height == 0 { even(if p.is_wide() { h } else { h.min(w * 9.0 / 16.0) }) } else { *height };
             let tw = even(th as f64 * 16.0 / 9.0);
             let crop = wide_crop(p).map_or(String::new(), |c| format!("{c},"));
-            format!("[0:v]{graded},{crop}{}[v]", finish_to(tw, th))
+            // Scaling must come before the grade: scaling a graded (RGB) picture shifts its colours.
+            format!("{lead}{crop}scale={tw}:{th}:flags=lanczos,{grade},{finish}[v]")
         }
-        Shape::Vertical(Framing::Blur) => format!(
-            "[0:v]{graded},split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=40:2[bg];\
-             [b]scale=1080:-2:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2:format=gbrp,{}[v]",
-            finish_to(1080, 1920)
-        ),
+        Shape::Vertical(Framing::Blur(layout)) => format!("{lead}{},{grade},{finish}[v]", blur_stack(*layout, "")),
         Shape::Vertical(framing) => {
             let crop = if p.vertical_share() >= 1.0 {
                 // Narrower than 9:16 already, so trim the height instead.
@@ -543,11 +683,48 @@ fn export_graph(job: &ExportJob) -> String {
                 let x = match framing {
                     Framing::Position(f) => format!("(in_w-out_w)*{f:.4}"),
                     Framing::Follow(points) => action_expression(points, job.start),
-                    Framing::Blur => unreachable!("handled above"),
+                    Framing::Blur(_) => unreachable!("handled above"),
                 };
                 format!("crop={cw}:{}:'{x}':0", even(h))
             };
-            format!("[0:v]{graded},{crop},{}[v]", finish_to(1080, 1920))
+            format!("{lead}{crop},scale=1080:1920:flags=lanczos,{grade},{finish}[v]")
+        }
+    }
+}
+
+/// The picture the colour grade is applied to: decoded, cropped and scaled to the final size, in standard
+/// HD video colour (BT.709, limited range) at a steady frame rate, as raw frames. Returns the filter graph
+/// and the frame size.
+pub fn geometry_graph(job: &ExportJob) -> (String, u32, u32) {
+    let p = &job.probe;
+    let mut pre = base_filters(p);
+    pre.extend(denoise_filter(job.finish));
+    let lead = if pre.is_empty() { "[0:v]".to_string() } else { format!("[0:v]{},", pre.join(",")) };
+    // Games and phones often record at an uneven rate; the card path needs a steady one.
+    let steady = format!("fps={:.5}", p.fps.clamp(1.0, 240.0));
+    // Whatever the source is, the card is handed standard HD video colour.
+    let standard = "scale=out_color_matrix=bt709:out_range=tv:flags=bicubic,format=yuv420p";
+    let (w, h) = (p.width as f64, p.height as f64);
+    match &job.shape {
+        Shape::Wide { height } => {
+            let th = if *height == 0 { even(if p.is_wide() { h } else { h.min(w * 9.0 / 16.0) }) } else { *height };
+            let tw = even(th as f64 * 16.0 / 9.0);
+            let crop = wide_crop(p).map_or(String::new(), |c| format!("{c},"));
+            (format!("{lead}{crop}scale={tw}:{th}:flags=lanczos,{steady},{standard}[v]"), tw, th)
+        }
+        Shape::Vertical(Framing::Blur(layout)) => (format!("{lead}{},{steady},{standard}[v]", blur_stack(*layout, "")), 1080, 1920),
+        Shape::Vertical(framing) => {
+            let crop = if p.vertical_share() >= 1.0 {
+                format!("crop={}:{}", even(w), even(w * 16.0 / 9.0))
+            } else {
+                let x = match framing {
+                    Framing::Position(f) => format!("(in_w-out_w)*{f:.4}"),
+                    Framing::Follow(points) => action_expression(points, job.start),
+                    Framing::Blur(_) => unreachable!("handled above"),
+                };
+                format!("crop={}:{}:'{x}':0", even(h * 9.0 / 16.0), even(h))
+            };
+            (format!("{lead}{crop},scale=1080:1920:flags=lanczos,{steady},{standard}[v]"), 1080, 1920)
         }
     }
 }
@@ -594,17 +771,33 @@ pub fn watch(mut child: Child, cancel: &AtomicBool, total: f64, progress: &mut i
 }
 
 /// Writes one finished video. The file only appears under its real name once complete.
-pub fn export(tools: &Tools, job: &ExportJob, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<(), String> {
+/// Returns the encoder that really did the work: if a graphics-card encoder fails
+/// (an old driver, a card that is busy), the same video is made on the processor instead.
+pub fn export(tools: &Tools, job: &ExportJob, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<Made, String> {
+    // The graphics card does the colour grade much faster. Whatever goes wrong with it
+    // (no card, an old driver, a failed check), the ordinary all-FFmpeg export takes over.
+    if let (Some(lut), Ok(grader)) = (&job.gpu_lut, crate::gpu::shared()) {
+        match crate::gpu::export(tools, job, lut, &grader, job.encoder, cancel, &mut progress) {
+            Ok(()) => return Ok(Made { encoder: job.encoder, gpu_grade: true }),
+            Err(e) if e == "Cancelled" => return Err(e),
+            Err(_) => {}
+        }
+    }
+    match export_once(tools, job, job.encoder, cancel, &mut progress) {
+        Err(e) if e != "Cancelled" && job.encoder != Encoder::Cpu => export_once(tools, job, Encoder::Cpu, cancel, &mut progress).map(|()| Made { encoder: Encoder::Cpu, gpu_grade: false }),
+        other => other.map(|()| Made { encoder: job.encoder, gpu_grade: false }),
+    }
+}
+
+fn export_once(tools: &Tools, job: &ExportJob, encoder: Encoder, cancel: &AtomicBool, progress: &mut impl FnMut(f32)) -> Result<(), String> {
     let part = job.output.with_extension("part.mp4");
     let length = (job.end - job.start).max(0.05);
     let mut cmd = hidden(&tools.ffmpeg);
-    cmd.current_dir(&job.workdir)
-        .args(["-y", "-v", "error", "-nostats", "-progress", "pipe:1"])
-        .args(["-ss", &format!("{:.3}", job.start), "-t", &format!("{length:.3}"), "-i"])
+    cmd.current_dir(&job.workdir).args(["-y", "-v", "error", "-nostats", "-progress", "pipe:1"]);
+    cmd.args(["-ss", &format!("{:.3}", job.start), "-t", &format!("{length:.3}"), "-i"])
         .arg(&job.input)
         .args(["-filter_complex", &export_graph(job), "-map", "[v]", "-map", "0:a:0?"])
-        .args(["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-profile:v", "high"])
-        .args(["-bf", "2", "-flags", "+cgop", "-g", &format!("{}", ((job.probe.fps / 2.0).round() as u32).max(1))])
+        .args(video_args(encoder, ((job.probe.fps / 2.0).round() as u32).max(1)))
         .args(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]);
     if job.probe.has_audio {
         if job.finish.loudness {
@@ -614,7 +807,7 @@ pub fn export(tools: &Tools, job: &ExportJob, cancel: &AtomicBool, mut progress:
     }
     cmd.args(["-movflags", "+faststart"]).arg(&part).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = cmd.spawn().map_err(|e| format!("Couldn't start the video tools: {e}"))?;
-    let result = watch(child, cancel, length, &mut progress);
+    let result = watch(child, cancel, length, progress);
     if result.is_ok() {
         std::fs::rename(&part, &job.output).map_err(|e| format!("Couldn't save the finished file: {e}"))?;
     } else {
@@ -713,6 +906,8 @@ pub mod tests {
             lut_file: "lut.cube".into(),
             workdir: dir.to_path_buf(),
             output: dir.join(name),
+            encoder: Encoder::Cpu,
+            gpu_lut: None,
         }
     }
 
@@ -745,7 +940,7 @@ pub mod tests {
             (Shape::Wide { height: 0 }, "wide.mp4", (1280, 720), 119.0),
             (Shape::Vertical(Framing::Position(0.5)), "vertical.mp4", (1080, 1920), 19.0),
             (Shape::Vertical(Framing::Follow(points)), "follow.mp4", (1080, 1920), 19.0),
-            (Shape::Vertical(Framing::Blur), "blur.mp4", (1080, 1920), 19.0),
+            (Shape::Vertical(Framing::Blur(BlurLayout { zoom: 1.4, x: 0.3, y: 0.4 })), "blur.mp4", (1080, 1920), 19.0),
         ];
         for (shape, name, size, length) in cases {
             let j = job(&dir, &input, &p, shape, name, 1.0 + length);
@@ -768,6 +963,139 @@ pub mod tests {
         }
         assert!((mean(&original.rgb)[0] - a[0]).abs() + (mean(&original.rgb)[2] - a[2]).abs() > 3.0, "the grade should change the picture");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn blur_layout_is_clamped_and_written_into_the_graph() {
+        let stack = blur_stack(BlurLayout { zoom: 9.0, x: -3.0, y: 0.25 }, "7");
+        assert!(stack.contains("scale=2700:-2"), "zoom is capped at 2.5: {stack}");
+        assert!(stack.contains("(iw-out_w)*0.0000") && stack.contains("(H-h)*0.2500"), "{stack}");
+        assert!(stack.contains("[a7][b7]") || stack.contains("split[a7][b7]"));
+        let default = blur_stack(BlurLayout::default(), "");
+        assert!(default.contains("scale=1296:-2") && default.contains("*0.5000"), "a little zoomed and centred by default: {default}");
+    }
+
+    /// Zooming and moving the main picture really changes the exported frame.
+    #[test]
+    fn the_blurred_background_layout_changes_the_picture() {
+        let Some(tools) = Tools::find() else { return };
+        let dir = scratch("blurlayout");
+        let input = dir.join("in.mp4");
+        make_video(&tools, &input, "1280x720", 6);
+        let p = probe(&tools, &input).unwrap();
+        Lut::build(5, &Grade::default(), None).write_cube(&dir.join("lut.cube")).unwrap();
+        let frame_of = |name: &str, layout: BlurLayout| {
+            let j = job(&dir, &input, &p, Shape::Vertical(Framing::Blur(layout)), name, 4.0);
+            export(&tools, &j, &AtomicBool::new(false), |_| {}).unwrap();
+            let made = probe(&tools, &j.output).unwrap();
+            assert_eq!((made.width, made.height), (1080, 1920), "{name}");
+            grab_frame(&tools, &made, &j.output, 1.5, &PLAIN).unwrap()
+        };
+        let whole = frame_of("whole.mp4", BlurLayout { zoom: 1.0, x: 0.5, y: 0.5 });
+        let zoomed = frame_of("zoomed.mp4", BlurLayout { zoom: 1.8, x: 0.5, y: 0.5 });
+        let moved = frame_of("moved.mp4", BlurLayout { zoom: 1.8, x: 0.0, y: 0.1 });
+        let difference = |a: &Frame, b: &Frame| a.rgb.iter().zip(&b.rgb).map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as f64).sum::<f64>() / a.rgb.len() as f64;
+        assert!(difference(&whole, &zoomed) > 4.0, "zoom made no difference: {}", difference(&whole, &zoomed));
+        assert!(difference(&zoomed, &moved) > 4.0, "moving made no difference: {}", difference(&zoomed, &moved));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_automatic_choice_uses_a_working_graphics_card_or_the_cpu() {
+        let all = [Encoder::Intel, Encoder::Nvidia];
+        assert_eq!(EncoderChoice::Auto.resolve(&all), Encoder::Nvidia, "NVIDIA is preferred when several work");
+        assert_eq!(EncoderChoice::Auto.resolve(&[]), Encoder::Cpu);
+        assert_eq!(EncoderChoice::Cpu.resolve(&all), Encoder::Cpu);
+        assert_eq!(EncoderChoice::Intel.resolve(&all), Encoder::Intel);
+        assert_eq!(EncoderChoice::Amd.resolve(&all), Encoder::Cpu, "an encoder that doesn't work here is never chosen");
+        for e in [Encoder::Cpu, Encoder::Nvidia, Encoder::Amd, Encoder::Intel] {
+            let args = video_args(e, 12);
+            assert!(args.contains(&e.codec().to_string()) && args.last().map(String::as_str) == Some("12"), "{e:?}: {args:?}");
+        }
+    }
+
+    /// Every graphics-card encoder this computer really has must produce a correct video.
+    #[test]
+    fn graphics_card_encoders_make_correct_videos() {
+        let Some(tools) = Tools::find() else { return };
+        let found = detect_encoders(&tools);
+        eprintln!("graphics-card encoders that work here: {found:?}");
+        let dir = scratch("gpu");
+        let input = dir.join("in.mp4");
+        make_video(&tools, &input, "1280x720", 8);
+        let p = probe(&tools, &input).unwrap();
+        Lut::build(5, &Grade::default(), None).write_cube(&dir.join("lut.cube")).unwrap();
+        for encoder in found {
+            for (shape, size) in [(Shape::Wide { height: 0 }, (1280, 720)), (Shape::Vertical(Framing::Position(0.5)), (1080, 1920))] {
+                let mut j = job(&dir, &input, &p, shape, &format!("{encoder:?}-{}.mp4", size.0), 7.0);
+                j.encoder = encoder;
+                let used = export(&tools, &j, &AtomicBool::new(false), |_| {}).unwrap_or_else(|e| panic!("{encoder:?}: {e}"));
+                assert_eq!(used.encoder, encoder, "{encoder:?} silently fell back to the CPU");
+                let made = probe(&tools, &j.output).unwrap();
+                assert_eq!((made.width, made.height), size, "{encoder:?}");
+                assert!((made.duration - 6.0).abs() < 0.5 && made.has_audio, "{encoder:?}: {made:?}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// If a graphics-card encoder can't be used, the video is still made, on the CPU.
+    #[test]
+    fn a_missing_graphics_encoder_falls_back_to_the_cpu() {
+        let Some(tools) = Tools::find() else { return };
+        let working = detect_encoders(&tools);
+        let Some(missing) = Encoder::HARDWARE.into_iter().find(|e| !working.contains(e)) else {
+            eprintln!("skipped: every graphics-card encoder works on this computer");
+            return;
+        };
+        let dir = scratch("fallback");
+        let input = dir.join("in.mp4");
+        make_video(&tools, &input, "640x360", 4);
+        let p = probe(&tools, &input).unwrap();
+        Lut::build(5, &Grade::default(), None).write_cube(&dir.join("lut.cube")).unwrap();
+        let mut j = job(&dir, &input, &p, Shape::Wide { height: 0 }, "out.mp4", 3.0);
+        j.encoder = missing;
+        let used = export(&tools, &j, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(used.encoder, Encoder::Cpu);
+        assert_eq!(probe(&tools, &j.output).unwrap().width, 640);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// How much faster the graphics card is here: `cargo test speed_comparison -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn speed_comparison_of_every_encoder() {
+        let Some(tools) = Tools::find() else { return };
+        let dir = scratch("speed");
+        let input = dir.join("in.mp4");
+        let status = hidden(&tools.ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=60:d=60", "-f", "lavfi", "-i", "sine=f=330:d=60", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let p = probe(&tools, &input).unwrap();
+        let lut = Arc::new(Lut::build(LUT_SIZE, &Grade { contrast: 0.2, ..Grade::default() }, None));
+        lut.write_cube(&dir.join("lut.cube")).unwrap();
+        let mut results = Vec::new();
+        let mut n = 0;
+        for (name, shape) in [("16:9", Shape::Wide { height: 0 }), ("9:16", Shape::Vertical(Framing::Position(0.5)))] {
+            for (encoder, on_card) in std::iter::once(Encoder::Cpu).chain(detect_encoders(&tools)).flat_map(|e| [(e, false), (e, true)]) {
+                n += 1;
+                let mut j = job(&dir, &input, &p, shape.clone(), &format!("speed{n}.mp4"), 61.0);
+                j.start = 0.0;
+                j.encoder = encoder;
+                j.gpu_lut = on_card.then(|| lut.clone());
+                let began = std::time::Instant::now();
+                export(&tools, &j, &AtomicBool::new(false), |_| {}).unwrap();
+                let seconds = began.elapsed().as_secs_f64();
+                let size = std::fs::metadata(&j.output).unwrap().len() as f64 / 1e6;
+                eprintln!("SPEED {name} {:<11} colour on {:<8} {seconds:6.1} s for 60 s of 1080p60  ({:.1}x real time)  {size:.1} MB", encoder.short(), if on_card { "the card" } else { "FFmpeg" }, 60.0 / seconds);
+                results.push((encoder, seconds));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!results.is_empty());
     }
 
     #[test]

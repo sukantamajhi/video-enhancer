@@ -9,9 +9,10 @@ use eframe::egui::{self, Color32, RichText, vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::grade::{Grade, LOOKS, LUT_SIZE, Lut};
-use crate::media::{self, Probe};
+use crate::media::{self, BlurLayout, Probe};
 use crate::montage::{self, Clip, Cut, Job, Music, Out, Sound, Style, Vertical};
 use crate::music::{self, Track};
+use crate::pack_ui::{self, MontageFacts, PackState};
 use crate::{App, Msg, ai, store};
 
 const MAX_CLIPS: usize = 12;
@@ -25,6 +26,8 @@ pub enum Event {
     Tracks(Result<Vec<Track>, String>),
     Progress(f32, String),
     Done(Result<Vec<PathBuf>, String>),
+    /// The moments exactly as they were rendered, and the music credit, for chapters and the description.
+    Rendered(Vec<Cut>, String),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -59,6 +62,14 @@ struct Saved {
     make_wide: bool,
     make_vertical: bool,
     out_dir: Option<PathBuf>,
+    #[serde(default)]
+    blur: BlurLayout,
+    #[serde(default)]
+    pack: Option<crate::pack::Pack>,
+    #[serde(default)]
+    rendered: Vec<Cut>,
+    #[serde(default)]
+    credit: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +84,7 @@ pub struct State {
     style: Style,
     sound: Sound,
     vertical: Vertical,
+    blur: BlurLayout,
     target: f64,
     look: Option<usize>,
     source: MusicSource,
@@ -90,6 +102,9 @@ pub struct State {
     out_dir: Option<PathBuf>,
     render: Option<(f32, String, Arc<AtomicBool>)>,
     made: Vec<PathBuf>,
+    pack: PackState,
+    rendered: Vec<Cut>,
+    credit: String,
 }
 
 impl State {
@@ -100,6 +115,7 @@ impl State {
             style: Style::Highlights,
             sound: Sound::MusicAndOriginal,
             vertical: Vertical::Follow,
+            blur: BlurLayout::default(),
             target: 60.0,
             look: Some(0),
             source: MusicSource::Online,
@@ -117,15 +133,22 @@ impl State {
             out_dir: None,
             render: None,
             made: Vec::new(),
+            pack: PackState::default(),
+            rendered: Vec::new(),
+            credit: String::new(),
         }
     }
 
     fn session(&self) -> Saved {
         Saved {
             clips: self.clips.iter().map(|c| c.path.clone()).collect(),
+            pack: self.pack.pack.clone(),
+            rendered: self.rendered.clone(),
+            credit: self.credit.clone(),
             style: self.style,
             sound: self.sound,
             vertical: self.vertical,
+            blur: self.blur,
             target: self.target,
             look: self.look,
             source: self.source,
@@ -153,7 +176,19 @@ impl State {
 
     /// True while something is running that needs the window to keep refreshing.
     pub fn working(&self) -> bool {
-        self.busy.is_some() || self.render.is_some() || self.searching || self.probing > 0
+        self.busy.is_some() || self.render.is_some() || self.searching || self.probing > 0 || self.pack.working()
+    }
+
+    pub fn pack_state(&mut self) -> &mut PackState {
+        &mut self.pack
+    }
+
+    /// What the upload pack needs: the moments as rendered (or as planned, until then), and the clips and colour.
+    pub fn pack_facts(&self) -> Option<MontageFacts> {
+        let plan = self.plan.as_ref()?;
+        let rendered = !self.rendered.is_empty();
+        let cuts: Vec<Cut> = if rendered { self.rendered.clone() } else { plan.cuts.iter().zip(&self.keep).filter(|(_, k)| **k).map(|(c, _)| c.clone()).collect() };
+        (!cuts.is_empty() && !self.clips.is_empty()).then(|| MontageFacts { clips: self.clips.clone(), cuts, grades: plan.grades.clone(), style: self.style, title: self.title.clone(), credit: self.credit.clone(), out_dir: self.out_dir.clone(), rendered })
     }
 
     fn total(&self) -> f64 {
@@ -165,7 +200,7 @@ fn clock(t: f64) -> String {
     format!("{}:{:02.0}", (t / 60.0) as u32, t % 60.0)
 }
 
-fn safe_name(title: &str) -> String {
+pub(crate) fn safe_name(title: &str) -> String {
     let name: String = title.trim().chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-').collect::<String>().split_whitespace().collect::<Vec<_>>().join("_");
     if name.is_empty() { "montage".into() } else { name.chars().take(40).collect() }
 }
@@ -205,6 +240,10 @@ impl App {
 
     pub fn montage_event(&mut self, event: Event) {
         match event {
+            Event::Rendered(cuts, credit) => {
+                self.mon.rendered = cuts;
+                self.mon.credit = credit;
+            }
             Event::Restored(clips, saved) => {
                 self.mon.probing = self.mon.probing.saturating_sub(1);
                 if clips.len() == saved {
@@ -215,6 +254,7 @@ impl App {
                     self.mon.clips = clips;
                     self.mon.plan = None;
                     self.mon.keep.clear();
+                    self.mon.rendered.clear();
                     self.note("Some clips from your last session are gone, so the AI plan was cleared. Plan again when you're ready.");
                 }
             }
@@ -234,6 +274,8 @@ impl App {
             Event::Plan(Ok(plan)) => {
                 self.mon.busy = None;
                 self.mon.keep = vec![true; plan.cuts.len()];
+                self.mon.rendered.clear();
+                self.mon.credit.clear();
                 self.mon.title = plan.title.clone();
                 self.mon.music_query = plan.music_query.clone();
                 let total: f64 = plan.cuts.iter().map(Cut::len).sum();
@@ -267,7 +309,8 @@ impl App {
                 self.mon.render = None;
                 match result {
                     Ok(files) => {
-                        self.note(format!("Finished. {} file(s) saved.", files.len()));
+                        let how = std::mem::take(&mut self.encode_info);
+                        self.note(format!("Finished. {} file(s) saved.{how}", files.len()));
                         self.mon.made = files;
                     }
                     Err(e) if e == "Cancelled" => self.note("Cancelled. Nothing half-finished was left behind."),
@@ -285,11 +328,17 @@ impl App {
         (m.file, m.tracks, m.music_query, m.title) = (saved.file, saved.tracks, saved.music_query, saved.title);
         m.track = saved.track.min(m.tracks.len().saturating_sub(1));
         (m.make_wide, m.make_vertical, m.out_dir) = (saved.make_wide, saved.make_vertical, saved.out_dir.filter(|d| d.is_dir()));
+        m.blur = saved.blur.clamped();
         m.keep = saved.keep;
         m.plan = saved.plan.filter(|p| p.cuts.len() == m.keep.len() && p.grades.len() == saved.clips.len());
         if m.plan.is_none() {
             m.keep.clear();
+            m.rendered.clear();
+        } else {
+            m.rendered = saved.rendered;
         }
+        m.credit = saved.credit;
+        m.pack = PackState::with(saved.pack);
         if saved.clips.is_empty() {
             return;
         }
@@ -398,13 +447,15 @@ impl App {
             return;
         }
         let (clips, grades, style, sound, vertical, target) = (m.clips.clone(), plan.grades.clone(), m.style, m.sound, m.vertical, m.target);
-        let (wide, tall, title) = (m.make_wide, m.make_vertical, m.title.trim().to_string());
+        let (wide, tall, title, blur) = (m.make_wide, m.make_vertical, m.title.trim().to_string(), m.blur);
+        let encoder = self.encoder_choice.resolve(&self.encoders);
         let out_dir = m.out_dir.clone().or_else(|| clips.first().and_then(|c| c.path.parent().map(PathBuf::from))).unwrap_or_else(std::env::temp_dir);
         let cancel = Arc::new(AtomicBool::new(false));
         self.mon.render = Some((0.0, "Getting ready…".into(), cancel.clone()));
         self.mon.made.clear();
         let mail = self.mail.clone();
         std::thread::spawn(move || {
+            let began = std::time::Instant::now();
             let work = std::env::temp_dir().join(format!("video-enhancer-montage-{}", std::process::id()));
             let result = (|| -> Result<Vec<PathBuf>, String> {
                 let say = |p: f32, text: &str| mail.send(Msg::Montage(Event::Progress(p, text.to_string())));
@@ -467,14 +518,17 @@ impl App {
                 let stem = safe_name(&title);
                 let shapes: Vec<(&str, Out, &str)> = [(wide, "16:9", Out::Wide, "_16x9"), (tall, "9:16", Out::Vertical(vertical), "_9x16")].into_iter().filter(|s| s.0).map(|s| (s.1, s.2, s.3)).collect();
                 let mut made = Vec::new();
+                let mut fell_back = false;
                 for (i, (label, out, suffix)) in shapes.iter().enumerate() {
                     let output = media::free_name(&out_dir, &stem, suffix, "mp4");
-                    let job = Job { clips: &clips, actions: &actions, cuts: &cuts, style, sound, music: song.as_ref(), out: *out, title: Some(&title), workdir: &work, output: &output };
+                    let job = Job { clips: &clips, actions: &actions, cuts: &cuts, style, sound, music: song.as_ref(), out: *out, encoder, blur, title: Some(&title), workdir: &work, output: &output };
                     let steps = shapes.len() as f32;
                     media_progress(&mail, i as f32, steps, label);
-                    montage::render(&tools, &job, &cancel, |f| media_progress(&mail, i as f32 + f, steps, label))?;
+                    fell_back |= montage::render(&tools, &job, &cancel, |f| media_progress(&mail, i as f32 + f, steps, label))? != encoder;
                     made.push(output);
                 }
+                mail.send(Msg::EncodeInfo(crate::encode_summary(began.elapsed().as_secs(), encoder, fell_back, false)));
+                mail.send(Msg::Montage(Event::Rendered(cuts.clone(), used.as_ref().map(Track::credit).unwrap_or_default())));
                 if let Some(t) = &used {
                     let credits = media::free_name(&out_dir, &stem, "_music_credits", "txt");
                     std::fs::write(&credits, music::credits_text(t)).map_err(|e| e.to_string())?;
@@ -488,7 +542,12 @@ impl App {
     }
 
     pub fn montage_screen(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // VE_SCROLL=900 starts the page scrolled down, for screenshots of the lower sections.
+        let mut area = egui::ScrollArea::vertical();
+        if let Some(y) = std::env::var("VE_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
+            area = area.vertical_scroll_offset(y);
+        }
+        area.show(ui, |ui| {
             ui.set_max_width(980.0);
             ui.heading("Montage");
             ui.label(RichText::new("Drop several clips here. The AI picks the best moments, and your real footage is cut together.").weak());
@@ -603,6 +662,20 @@ impl App {
                 ui.selectable_value(&mut self.mon.vertical, Vertical::Blur, "Whole picture on a blurred background");
             });
             ui.end_row();
+
+            if self.mon.vertical == Vertical::Blur {
+                ui.label("Main picture");
+                ui.vertical(|ui| {
+                    ui.add(egui::Slider::new(&mut self.mon.blur.zoom, 1.0..=2.0).text("zoom").fixed_decimals(2));
+                    ui.add(egui::Slider::new(&mut self.mon.blur.x, 0.0..=1.0).text("left / right").fixed_decimals(2));
+                    ui.add(egui::Slider::new(&mut self.mon.blur.y, 0.0..=1.0).text("up / down").fixed_decimals(2));
+                    if ui.small_button("Centre and reset").clicked() {
+                        self.mon.blur = BlurLayout::default();
+                    }
+                    ui.label(RichText::new("Zoom trims the sides so the picture fills more of the tall frame. Left / right only matters when zoomed.").weak().small());
+                });
+                ui.end_row();
+            }
 
             ui.label("Anything special?");
             ui.add(egui::TextEdit::multiline(&mut self.style_notes).desired_rows(2).desired_width(420.0));
@@ -737,6 +810,7 @@ impl App {
                 self.mon.out_dir = Some(dir);
             }
         });
+        self.encoder_picker(ui, false);
         if let Some((progress, label, cancel)) = &self.mon.render {
             ui.label(label);
             ui.add(egui::ProgressBar::new(*progress).show_percentage());
@@ -759,6 +833,9 @@ impl App {
                 ui.label(RichText::new(file.display().to_string()).small());
             }
         }
+        ui.add_space(10.0);
+        ui.separator();
+        self.pack_ui(ui, pack_ui::Target::Montage);
     }
 }
 
