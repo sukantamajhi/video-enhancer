@@ -59,6 +59,68 @@ pub struct Pack {
     pub candidates: Vec<Candidate>,
     /// The music credit, when the video uses music that asks for one.
     pub credit: String,
+    #[serde(default)]
+    pub format: PackFormat,
+    /// The one search phrase the title and description are built around.
+    #[serde(default)]
+    pub primary_keyword: String,
+    #[serde(default)]
+    pub secondary_keywords: Vec<String>,
+    /// Hidden tags. YouTube says they matter little, mostly for misspellings.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Which kind of YouTube page the pack is for: the rules for a Short are different.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum PackFormat {
+    #[default]
+    Standard,
+    Short,
+}
+
+impl PackFormat {
+    pub const ALL: [PackFormat; 2] = [PackFormat::Standard, PackFormat::Short];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PackFormat::Standard => "Standard video (16:9)",
+            PackFormat::Short => "Short (9:16)",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            PackFormat::Standard => "a standard widescreen YouTube video",
+            PackFormat::Short => "a vertical YouTube Short",
+        }
+    }
+}
+
+/// Hidden tags kept to a sensible size. Only distinct, short ones, and well under the 500 characters
+/// YouTube Studio allows (commas count).
+pub const MAX_TAGS: usize = 12;
+pub const MAX_TAG_CHARS: usize = 450;
+
+pub fn clean_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for t in tags {
+        let tag: String = t.trim().trim_start_matches('#').split_whitespace().collect::<Vec<_>>().join(" ").chars().take(40).collect();
+        if tag.is_empty() || out.iter().any(|o| o.eq_ignore_ascii_case(&tag)) {
+            continue;
+        }
+        let cost = tag.chars().count() + usize::from(!out.is_empty());
+        if total + cost > MAX_TAG_CHARS {
+            break;
+        }
+        total += cost;
+        out.push(tag);
+        if out.len() == MAX_TAGS {
+            break;
+        }
+    }
+    out
 }
 
 pub fn stamp(seconds: f64) -> String {
@@ -145,7 +207,7 @@ pub fn build_chapters(segments: &[Segment], titles: &HashMap<usize, String>) -> 
 
 impl Pack {
     /// Builds the pack from what the AI said, the real chapter moments and the frames on offer.
-    pub fn assemble(ai: &AiPack, segments: &[Segment], candidates: Vec<Candidate>, credit: String) -> Result<Pack, String> {
+    pub fn assemble(ai: &AiPack, segments: &[Segment], candidates: Vec<Candidate>, credit: String, format: PackFormat) -> Result<Pack, String> {
         let titles = clean_titles(&ai.titles);
         if titles.is_empty() {
             return Err("The AI didn't write any titles. Try again.".into());
@@ -154,17 +216,29 @@ impl Pack {
             return Err("There is no frame to make a thumbnail from.".into());
         }
         let said: HashMap<usize, String> = ai.chapter_titles.iter().cloned().collect();
+        let mut hashtags = clean_hashtags(&ai.hashtags);
+        if format == PackFormat::Short && !hashtags.iter().take(3).any(|t| t.eq_ignore_ascii_case("shorts")) {
+            // The game or topic stays first; Shorts takes second place, inside the three YouTube shows above the title.
+            hashtags.retain(|t| !t.eq_ignore_ascii_case("shorts"));
+            hashtags.insert(1.min(hashtags.len()), "Shorts".into());
+            hashtags.truncate(5);
+        }
         Ok(Pack {
             titles,
             title_pick: 0,
             intro: tidy(&ai.intro.replace("\n\n", "\u{1}"), 900).replace('\u{1}', "\n\n"),
-            chapters: build_chapters(segments, &said),
-            hashtags: clean_hashtags(&ai.hashtags),
+            // A Short has no chapters.
+            chapters: if format == PackFormat::Short { Vec::new() } else { build_chapters(segments, &said) },
+            hashtags,
             thumb_text: clean_thumb_text(&ai.thumb_text),
             thumb_pick: ai.thumb_candidate.min(candidates.len() - 1),
             reason: tidy(&ai.reason, 240),
             candidates,
             credit,
+            format,
+            primary_keyword: tidy(&ai.primary_keyword, 60),
+            secondary_keywords: ai.secondary_keywords.iter().map(|k| tidy(k, 60)).filter(|k| !k.is_empty()).take(3).collect(),
+            tags: clean_tags(&ai.tags),
         })
     }
 
@@ -190,7 +264,106 @@ impl Pack {
     /// Everything as one text file.
     pub fn as_text(&self) -> String {
         let titles: Vec<String> = self.titles.iter().enumerate().map(|(i, t)| format!("{}. {t}", i + 1)).collect();
-        format!("TITLE OPTIONS\n{}\n\nDESCRIPTION (paste this under the video)\n{}\n\nTHUMBNAIL TEXT\n{}\n", titles.join("\n"), self.description(), self.thumb_text)
+        let focus = if self.primary_keyword.is_empty() { String::new() } else { format!("FOCUS KEYWORD\n{}\n\n", self.primary_keyword) };
+        let tags = if self.tags.is_empty() { String::new() } else { format!("\n\nTAGS (optional, in YouTube Studio under Show more)\n{}", self.tags.join(", ")) };
+        format!("{focus}TITLE OPTIONS\n{}\n\nDESCRIPTION (paste this under the video)\n{}\n\nTHUMBNAIL TEXT\n{}{tags}\n", titles.join("\n"), self.description(), self.thumb_text)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    Good,
+    Warn,
+    Bad,
+}
+
+#[derive(Clone, Debug)]
+pub struct Check {
+    pub level: Level,
+    pub text: String,
+}
+
+/// Lower case, letters and digits only, single spaces: so "Valorant: Clutch!" matches "valorant clutch".
+fn norm(text: &str) -> String {
+    text.chars().flat_map(|c| if c.is_alphanumeric() { c.to_lowercase().collect::<Vec<_>>() } else { vec![' '] }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl Pack {
+    /// Checks the title and description as they are now (including your edits) against what
+    /// YouTube says about search, and against the widely used length rules of thumb.
+    pub fn seo_checks(&self) -> Vec<Check> {
+        use Level::*;
+        let mut out: Vec<Check> = Vec::new();
+        let mut add = |level: Level, text: String| out.push(Check { level, text });
+        let title = self.titles.get(self.title_pick).map_or("", String::as_str);
+        let (n, good) = (title.chars().count(), if self.format == PackFormat::Short { 40 } else { 60 });
+        if n == 0 {
+            add(Bad, "There is no title.".into());
+        } else if n > MAX_TITLE {
+            add(Bad, format!("The title is {n} characters, over YouTube's limit of {MAX_TITLE}."));
+        } else if n <= good {
+            add(Good, format!("The title is {n} characters, short enough to show in full."));
+        } else {
+            add(Warn, format!("The title is {n} characters and may be cut off in search results. Aim for {good} or fewer."));
+        }
+
+        let description = self.description();
+        let keyword = norm(&self.primary_keyword);
+        if keyword.is_empty() {
+            add(Warn, "No focus keyword was chosen, so the keyword checks are skipped.".into());
+        } else {
+            let shown = &self.primary_keyword;
+            let t = norm(title);
+            match t.find(&keyword) {
+                None => add(Warn, format!("The focus keyword \"{shown}\" is not in the title.")),
+                Some(at) if at <= t.len() / 2 => add(Good, format!("The title has the focus keyword \"{shown}\", near the start.")),
+                Some(_) => add(Warn, format!("The focus keyword \"{shown}\" is in the title but late. Earlier is better.")),
+            }
+            let opening: String = description.chars().take(150).collect();
+            if norm(&opening).contains(&keyword) {
+                add(Good, "The focus keyword is in the first 150 characters of the description, which is what viewers see first.".into());
+            } else {
+                add(Warn, "The focus keyword is not in the first 150 characters of the description, which is what viewers see first.".into());
+            }
+            let count = norm(&description).matches(&keyword).count();
+            match count {
+                0 => add(Warn, "The focus keyword never appears in the description.".into()),
+                1..=4 => add(Good, format!("The focus keyword appears {count} time(s) in the description, which reads naturally.")),
+                _ => add(Warn, format!("The focus keyword appears {count} times in the description. That can read as keyword stuffing.")),
+            }
+        }
+
+        match self.hashtags.len() {
+            3..=5 => add(Good, format!("{} hashtags. YouTube shows the first three above the title.", self.hashtags.len())),
+            0 => add(Warn, "There are no hashtags.".into()),
+            1 | 2 => add(Warn, format!("Only {} hashtag(s). Three to five work well.", self.hashtags.len())),
+            more => add(Warn, format!("{more} hashtags is a lot. YouTube shows only the first three above the title, and over-tagging looks like spam.")),
+        }
+        if self.format == PackFormat::Standard {
+            if self.chapters.len() >= 3 {
+                add(Good, format!("{} chapters, which YouTube turns into a timeline.", self.chapters.len()));
+            } else {
+                add(Warn, "No chapters: YouTube needs at least three, ten seconds apart, so this video is too short for them.".into());
+            }
+        }
+        let tag_chars: usize = self.tags.iter().map(|t| t.chars().count() + 1).sum();
+        if self.tags.is_empty() {
+            add(Warn, "No tags. They matter little, but they help with misspellings of the game's name.".into());
+        } else if tag_chars <= MAX_TAG_CHARS + MAX_TAGS {
+            add(Good, format!("{} tags. They matter little for discovery, so this is plenty.", self.tags.len()));
+        } else {
+            add(Warn, "The tags are very long. Fewer, better tags are safer than many.".into());
+        }
+        let thumb_words = self.thumb_text.split_whitespace().count();
+        if (1..=3).contains(&thumb_words) && self.thumb_text.chars().count() <= 18 {
+            add(Good, "The thumbnail text is short enough to read when small.".into());
+        } else {
+            add(Warn, "The thumbnail text is long: aim for 1 to 3 words and 18 characters or fewer.".into());
+        }
+        if description.chars().count() > 5000 {
+            add(Bad, "The description is over YouTube's limit of 5000 characters.".into());
+        }
+        out
     }
 }
 
@@ -283,6 +456,9 @@ mod tests {
             thumb_candidate: 9,
             thumb_text: "insane clutch!!! wow".into(),
             reason: "clear action".into(),
+            primary_keyword: "Valorant clutch".into(),
+            secondary_keywords: vec!["1v5".into(), "ace".into(), "comeback".into(), "extra".into()],
+            tags: vec!["valorant".into(), "valorent".into(), "Valorant".into()],
         }
     }
 
@@ -322,14 +498,14 @@ mod tests {
     #[test]
     fn the_description_is_ready_to_paste() {
         let segments = [seg(0.0, "start"), seg(20.0, "middle"), seg(3700.0, "late")];
-        let pack = Pack::assemble(&ai(&["One", "Two"]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], "\"Song\" by Ann (CC BY)".into()).unwrap();
+        let pack = Pack::assemble(&ai(&["One", "Two"]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], "\"Song\" by Ann (CC BY)".into(), PackFormat::Standard).unwrap();
         let text = pack.description();
         assert!(text.starts_with("A wild session."), "{text}");
         assert!(text.contains("Chapters:\n0:00 The start\n0:20 middle\n1:01:40 Big clutch"), "{text}");
         assert!(text.contains("Music: \"Song\" by Ann (CC BY)") && text.trim_end().ends_with("#Gaming #clutchplay"), "{text}");
         assert_eq!((pack.thumb_pick, pack.thumb_text.as_str(), pack.titles.len()), (0, "INSANE CLUTCH!!! WOW", 2), "an out-of-range frame choice is brought back in range");
-        assert!(Pack::assemble(&ai(&[]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], String::new()).is_err());
-        assert!(Pack::assemble(&ai(&["One"]), &segments, vec![], String::new()).is_err());
+        assert!(Pack::assemble(&ai(&[]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], String::new(), PackFormat::Standard).is_err());
+        assert!(Pack::assemble(&ai(&["One"]), &segments, vec![], String::new(), PackFormat::Standard).is_err());
         assert!(pack.as_text().contains("1. One") && pack.as_text().contains("2. Two"));
     }
 
@@ -357,5 +533,87 @@ mod tests {
         let reds = |img: &image::RgbImage| img.pixels().map(|p| p[0] as i64 - p[2] as i64).sum::<i64>();
         assert!(reds(&rgb(&warm)) > reds(&b), "the warm grade did not reach the thumbnail");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn pack(title: &str, intro: &str) -> Pack {
+        Pack {
+            titles: vec![title.into()],
+            intro: intro.into(),
+            chapters: vec![Chapter { at: 0.0, title: "Start".into() }, Chapter { at: 20.0, title: "Fight".into() }, Chapter { at: 50.0, title: "End".into() }],
+            hashtags: vec!["Valorant".into(), "clutch".into(), "fps".into()],
+            tags: vec!["valorant".into(), "valorant clutch".into()],
+            thumb_text: "INSANE CLUTCH".into(),
+            primary_keyword: "Valorant clutch".into(),
+            ..Pack::default()
+        }
+    }
+
+    #[test]
+    fn a_well_made_pack_passes_every_seo_check() {
+        let p = pack("Valorant Clutch: Winning a 1v5 With 1 HP", "This Valorant clutch turns a lost round around in the last ten seconds. Watch how the 1v5 plays out.");
+        let checks = p.seo_checks();
+        assert!(checks.iter().all(|c| c.level == Level::Good), "{checks:#?}");
+        assert!(checks.len() >= 7);
+    }
+
+    #[test]
+    fn the_checks_catch_the_common_mistakes() {
+        // A title that is too long and has no keyword; a description that never says it; too many hashtags.
+        let long = "Absolutely Unbelievable Gameplay Moment That You Will Not Believe When You See What Happens Next".to_string();
+        let mut p = pack(&long, "Something amazing happens here.");
+        p.hashtags = (0..8).map(|i| format!("tag{i}")).collect();
+        let text: Vec<String> = p.seo_checks().iter().filter(|c| c.level != Level::Good).map(|c| c.text.clone()).collect();
+        let joined = text.join(" | ");
+        for needle in ["may be cut off", "not in the title", "not in the first 150", "never appears", "8 hashtags is a lot"] {
+            assert!(joined.contains(needle), "missing '{needle}' in: {joined}");
+        }
+        // Over YouTube's hard limit is a failure, not a warning.
+        let mut over = pack(&"x".repeat(120), "ok");
+        over.titles[0] = "x".repeat(120);
+        assert!(over.seo_checks().iter().any(|c| c.level == Level::Bad && c.text.contains("limit of 100")));
+        // The keyword buried late in the title, and stuffed in the description.
+        let late = pack("An absolutely wild round to watch tonight with Valorant clutch", "Valorant clutch. Valorant clutch. Valorant clutch. Valorant clutch. Valorant clutch.");
+        let joined: String = late.seo_checks().iter().filter(|c| c.level == Level::Warn).map(|c| c.text.clone()).collect::<Vec<_>>().join(" | ");
+        assert!(joined.contains("late") && joined.contains("keyword stuffing"), "{joined}");
+    }
+
+    #[test]
+    fn keyword_matching_ignores_case_and_punctuation() {
+        assert_eq!(norm("Valorant: CLUTCH!"), "valorant clutch");
+        let p = pack("VALORANT: Clutch (1v5)!", "valorant, clutch... a story");
+        assert!(p.seo_checks().iter().any(|c| c.level == Level::Good && c.text.contains("near the start")));
+    }
+
+    #[test]
+    fn a_short_gets_no_chapters_and_the_shorts_hashtag() {
+        let segments = [seg(0.0, "a"), seg(15.0, "b"), seg(30.0, "c"), seg(45.0, "d")];
+        let short = Pack::assemble(&ai(&["One"]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], String::new(), PackFormat::Short).unwrap();
+        assert!(short.chapters.is_empty());
+        assert_eq!(short.hashtags[1], "Shorts", "the topic stays first and Shorts is inside the three YouTube shows: {:?}", short.hashtags);
+        assert!(short.hashtags.len() <= 5);
+        assert!(!short.seo_checks().iter().any(|c| c.text.contains("chapter")), "a Short isn't checked for chapters");
+        // A standard video keeps its chapters and gets no Shorts tag.
+        let standard = Pack::assemble(&ai(&["One"]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], String::new(), PackFormat::Standard).unwrap();
+        assert!(standard.chapters.len() >= 3 && !standard.hashtags.iter().any(|t| t == "Shorts"));
+    }
+
+    #[test]
+    fn tags_are_distinct_short_and_capped() {
+        let tags = clean_tags(&["#Valorant".into(), "valorant".into(), "  valorant   clutch ".into(), "".into(), "x".repeat(80)]);
+        assert_eq!(tags[0], "Valorant");
+        assert_eq!(tags[1], "valorant clutch");
+        assert!(tags[2].chars().count() <= 40, "{tags:?}");
+        let many: Vec<String> = (0..60).map(|i| format!("tag number {i}")).collect();
+        let capped = clean_tags(&many);
+        assert!(capped.len() <= MAX_TAGS && capped.iter().map(|t| t.chars().count() + 1).sum::<usize>() <= MAX_TAG_CHARS + 1);
+    }
+
+    #[test]
+    fn the_saved_text_has_the_keyword_and_tags() {
+        let p = Pack::assemble(&ai(&["Valorant Clutch In 1v5"]), &[seg(0.0, "a")], vec![candidate(Path::new("a.mp4"), 1.0)], String::new(), PackFormat::Standard).unwrap();
+        let text = p.as_text();
+        assert!(text.starts_with("FOCUS KEYWORD\nValorant clutch") && text.contains("TAGS (optional") && text.contains("valorant, valorent"), "{text}");
+        assert_eq!(p.secondary_keywords.len(), 3, "no more than three secondary keywords");
+        assert_eq!(p.tags, vec!["valorant", "valorent"], "tags are de-duplicated ignoring case");
     }
 }

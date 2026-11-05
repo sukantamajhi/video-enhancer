@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::grade::{self, Grade, LearnedLook};
 use crate::media::{self, Frame, GrabOptions, Tools};
 use crate::montage::{Cut, Style};
-use crate::pack::{self, Segment};
+use crate::pack::{self, PackFormat, Segment};
 
 pub const GEMINI_MODEL: &str = "gemini-omni-1.1-flash";
 pub const OPENAI_MODELS: [(&str, &str); 3] = [
@@ -406,6 +406,10 @@ pub fn openai_plan(key: &str, model: &str, clips: &[ClipBrief], style: Style, ta
 
 // ------------------------------------------------------------ upload-ready pack
 
+/// Bump this when the instructions or the answer's shape change, so saved answers
+/// written under the old wording are not reused.
+pub const PACK_PROMPT_VERSION: &str = "seo-2";
+
 /// What the AI wrote for the video's page. The chapter times are not here on
 /// purpose: the app knows where each moment really is, so it supplies them.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -418,23 +422,76 @@ pub struct AiPack {
     pub thumb_candidate: usize,
     pub thumb_text: String,
     pub reason: String,
+    #[serde(default)]
+    pub primary_keyword: String,
+    #[serde(default)]
+    pub secondary_keywords: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 pub struct PackRequest<'a> {
     pub kind: &'a str,
     pub duration: f64,
     pub notes: &'a str,
+    /// The game or subject, as the creator wants it spelled. Empty when not given.
+    pub topic: &'a str,
+    pub format: PackFormat,
     pub segments: &'a [Segment],
     /// Candidate thumbnail frames, each with a label that says where it is from.
     pub frames: &'a [(String, Frame)],
+}
+
+/// The standing instructions: YouTube search optimisation done honestly.
+///
+/// They follow YouTube's own guidance: one or two main keywords placed prominently in the
+/// title and description, the first lines of the description describing the video, tags
+/// playing only a minor part, at most three hashtags shown above the title, and no
+/// misleading titles, thumbnails or descriptions (YouTube treats those as spam).
+/// The length figures (about 60 characters for a title, about 150 for the opening of the
+/// description) are widely used rules of thumb, not YouTube limits, and are worded that way.
+pub fn pack_instructions(format: PackFormat) -> String {
+    let (title_rule, description_rule, chapter_rule, hashtag_rule) = match format {
+        PackFormat::Standard => (
+            "Keep each title to 60 characters or fewer when you can: longer titles tend to be cut off in search results and on phones. Never go above 90.",
+            "The first sentence must be under 150 characters, because viewers see only the first lines before \"Show more\". It must describe the video and contain the primary keyword. Then add two or three more sentences.",
+            "For each moment number, write a chapter title of 2 to 5 words that says what happens there. Use the primary keyword in a chapter title only where it fits naturally.",
+            "",
+        ),
+        PackFormat::Short => (
+            "Keep each title to 40 characters or fewer: Shorts are skimmed quickly in a feed.",
+            "Write one or two short sentences. The first must be under 100 characters and contain the primary keyword.",
+            "Shorts have no chapters, but still return a very short title for each moment number.",
+            "Include Shorts as one of the three most important hashtags.",
+        ),
+    };
+    format!(
+        "You are a YouTube search-optimisation and packaging specialist for gaming creators. You write the title, description, hashtags, tags and thumbnail text for ONE video, so that people searching YouTube can find it and want to watch it, and so that every word is true to what the video shows.\n\n\
+         How this works:\n\
+         - YouTube matches what people type mainly against the title, thumbnail and description. Tags matter very little. Hashtags help a little.\n\
+         - Search results and the video page show the title and the first lines of the description first.\n\
+         - Misleading titles, thumbnails, descriptions, unrelated hashtags and excessive tags break YouTube's spam policy. Honest and specific always beats clever.\n\n\
+         Rules:\n\
+         1. Focus keyword. Choose ONE primary keyword: 1 to 4 words a viewer would really type to find this video, usually the game name plus what happens (for example \"Valorant clutch\" or \"Minecraft speedrun\"). Also choose up to 3 secondary keywords: related searches. Use the game or topic exactly as the creator spelled it. If no game or topic was given, name a game ONLY if its title, logo or interface is clearly visible in the pictures; otherwise write about the action without naming a game. Never guess a game, character, map, score, rank, player name or any fact you cannot see or were not told.\n\
+         2. Titles. Write exactly three, each from a different angle: (a) keyword-first and descriptive, (b) the result or moment that makes people curious, (c) the stakes or a specific detail that is really in the footage. {title_rule} Put the primary keyword in the first half of every title. Use normal capitalisation (no ALL-CAPS words), at most one emoji, no quotation marks and no hashtags in the title. Never promise anything the video does not show.\n\
+         3. Description intro. {description_rule} State plainly what the video shows. Use the primary keyword once in the first sentence and, naturally, one or two secondary keywords later. Write for people, not for a robot: no keyword lists, no repeated sentences, no calls to like or subscribe, no links, no timestamps and no hashtags (the app adds the chapters, music credit and hashtags itself). Do not mention AI unless the creator told you to.\n\
+         4. Chapter titles. {chapter_rule}\n\
+         5. Hashtags. Give 3 to 5, with no spaces and no # sign, each clearly relevant. Order them by importance: YouTube shows only the first three above the title, so the game or topic comes first. {hashtag_rule}\n\
+         6. Tags. Give 8 to 12 hidden tags: spelling variants and common misspellings of the game name, and close phrases. They matter little, so never pad: fewer good tags beat many weak ones. Keep the total under 400 characters.\n\
+         7. Thumbnail. Choose the candidate frame with the clearest subject and the strongest action or emotion, one that stays readable when small. Write 1 to 3 words in capitals (at most 18 characters) that add to the title instead of repeating it. It must be true to the footage.\n\
+         8. Write in the language of the creator's notes (English if there are none).\n\
+         9. Never invent sponsors, links, social handles, prices, rankings or claims."
+    )
 }
 
 fn pack_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "titles": { "type": "array", "items": { "type": "string" }, "description": "Exactly three different title options, each under 70 characters, hooky but honest, no quotation marks" },
-            "intro": { "type": "string", "description": "Two or three plain sentences for the top of the description. No timestamps, no hashtags, no links" },
+            "primary_keyword": { "type": "string", "description": "The one main search phrase, 1 to 4 words" },
+            "secondary_keywords": { "type": "array", "items": { "type": "string" }, "description": "Up to three related search phrases" },
+            "titles": { "type": "array", "items": { "type": "string" }, "description": "Exactly three different titles, primary keyword in the first half, honest" },
+            "intro": { "type": "string", "description": "The description intro: the first sentence names the video and the primary keyword. No timestamps, hashtags or links" },
             "chapter_titles": {
                 "type": "array",
                 "items": {
@@ -447,19 +504,20 @@ fn pack_schema() -> Value {
                     "additionalProperties": false,
                 },
             },
-            "hashtags": { "type": "array", "items": { "type": "string" }, "description": "Three to five hashtags without the # sign, no spaces" },
+            "hashtags": { "type": "array", "items": { "type": "string" }, "description": "Three to five hashtags without the # sign, no spaces, most important first" },
+            "tags": { "type": "array", "items": { "type": "string" }, "description": "Eight to twelve hidden tags, under 400 characters in total" },
             "thumbnail": {
                 "type": "object",
                 "properties": {
                     "candidate": { "type": "integer", "description": "The candidate frame number with the clearest action or strongest emotion" },
-                    "text": { "type": "string", "description": "One to three words in capitals to print on the thumbnail, for example INSANE CLUTCH" },
+                    "text": { "type": "string", "description": "One to three words in capitals, at most 18 characters, adding to the title" },
                     "reason": { "type": "string", "description": "One short sentence on why this frame" },
                 },
                 "required": ["candidate", "text", "reason"],
                 "additionalProperties": false,
             },
         },
-        "required": ["titles", "intro", "chapter_titles", "hashtags", "thumbnail"],
+        "required": ["primary_keyword", "secondary_keywords", "titles", "intro", "chapter_titles", "hashtags", "tags", "thumbnail"],
         "additionalProperties": false,
     })
 }
@@ -481,12 +539,14 @@ fn parse_pack(parsed: &Value) -> Result<AiPack, String> {
         thumb_candidate: thumb["candidate"].as_u64().unwrap_or(0) as usize,
         thumb_text: thumb["text"].as_str().unwrap_or("").to_string(),
         reason: thumb["reason"].as_str().unwrap_or("").to_string(),
+        primary_keyword: parsed["primary_keyword"].as_str().unwrap_or("").to_string(),
+        secondary_keywords: strings("secondary_keywords"),
+        tags: strings("tags"),
     })
 }
 
-/// Shows the AI the video's moments and a few candidate frames, and gets back the titles,
-/// description text, hashtags and thumbnail choice.
-pub fn openai_pack(key: &str, model: &str, req: &PackRequest) -> Result<AiPack, String> {
+/// The whole request, built without any network, so it can be checked.
+fn pack_body(model: &str, req: &PackRequest) -> Result<Value, String> {
     let moments: Vec<String> = req
         .segments
         .iter()
@@ -494,17 +554,17 @@ pub fn openai_pack(key: &str, model: &str, req: &PackRequest) -> Result<AiPack, 
         .take(40)
         .map(|(i, s)| if s.note.trim().is_empty() { format!("{i}: at {}", pack::stamp(s.at)) } else { format!("{i}: at {}, {}", pack::stamp(s.at), s.note.trim()) })
         .collect();
+    let topic = if req.topic.trim().is_empty() { "not given".to_string() } else { req.topic.trim().to_string() };
+    let notes = if req.notes.trim().is_empty() { "none".to_string() } else { req.notes.trim().to_string() };
     let mut content = vec![json!({
         "type": "input_text",
         "text": format!(
-            "You package YouTube gaming videos for creators. This video is {}, {} long. {}\n\
+            "Video: {}, {} long.\nFormat: {}.\nGame or topic given by the creator (use exactly this spelling): {topic}\nThe creator's notes: {notes}\n\n\
              Moments in the video, in order (number: time, what happens):\n{}\n\n\
-             Write the title options, the description intro, a short chapter title for each moment number above, the hashtags, \
-             and choose the thumbnail from the candidate frames that follow. Be specific to what the footage shows. \
-             Do not invent game names, scores or facts you cannot see or were not told.",
+             Candidate thumbnail frames follow, each labelled with its number.",
             req.kind,
             pack::stamp(req.duration),
-            if req.notes.trim().is_empty() { String::new() } else { format!("The creator says: {}.", req.notes.trim()) },
+            req.format.describe(),
             moments.join("\n"),
         ),
     })];
@@ -512,11 +572,18 @@ pub fn openai_pack(key: &str, model: &str, req: &PackRequest) -> Result<AiPack, 
         content.push(json!({ "type": "input_text", "text": format!("Candidate frame {i}: {label}") }));
         content.push(json!({ "type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", STANDARD.encode(encode_jpeg(frame, 80)?)), "detail": "low" }));
     }
-    let body = json!({
+    Ok(json!({
         "model": model,
+        "instructions": pack_instructions(req.format),
         "input": [{ "role": "user", "content": content }],
         "text": { "format": { "type": "json_schema", "name": "upload_pack", "strict": true, "schema": pack_schema() } },
-    });
+    }))
+}
+
+/// Shows the AI the video's moments and a few candidate frames, and gets back the keyword-aware
+/// titles, description text, hashtags, tags and thumbnail choice.
+pub fn openai_pack(key: &str, model: &str, req: &PackRequest) -> Result<AiPack, String> {
+    let body = pack_body(model, req)?;
     let reply = post_json("https://api.openai.com/v1/responses", &[("authorization", format!("Bearer {key}"))], &body, 240)?;
     let parsed: Value = serde_json::from_str(&openai_text(&reply)?).map_err(|e| format!("The answer wasn't valid: {e}"))?;
     parse_pack(&parsed)
@@ -524,6 +591,42 @@ pub fn openai_pack(key: &str, model: &str, req: &PackRequest) -> Result<AiPack, 
 
 #[cfg(test)]
 mod tests {
+    fn tiny_frame() -> Frame {
+        Frame { width: 2, height: 2, rgb: vec![120; 12] }
+    }
+
+    #[test]
+    fn the_instructions_carry_the_search_rules_for_each_format() {
+        let long = pack_instructions(PackFormat::Standard);
+        for needle in ["ONE primary keyword", "first half of every title", "60 characters", "150 characters", "Show more", "first three above the title", "spam policy", "Never guess a game", "under 400 characters", "no hashtags"] {
+            assert!(long.contains(needle), "the standard instructions lost: {needle}");
+        }
+        let short = pack_instructions(PackFormat::Short);
+        assert!(short.contains("40 characters") && short.contains("Shorts as one of the three") && !short.contains("150 characters"), "{short}");
+        assert_ne!(long, short);
+    }
+
+    #[test]
+    fn the_request_puts_the_rules_in_instructions_and_the_facts_in_the_input() {
+        let segments = vec![Segment { at: 0.0, note: "enemy rush".into() }, Segment { at: 31.0, note: String::new() }];
+        let frames = vec![("moment 0".to_string(), tiny_frame()), ("at 0:31".to_string(), tiny_frame())];
+        let req = PackRequest { kind: "a single gameplay recording", duration: 92.0, notes: "keep it funny", topic: " Valorant ", format: PackFormat::Short, segments: &segments, frames: &frames };
+        let body = pack_body("gpt-6-luna", &req).unwrap();
+        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["instructions"].as_str().unwrap(), pack_instructions(PackFormat::Short));
+        let content = body["input"][0]["content"].as_array().unwrap();
+        let first = content[0]["text"].as_str().unwrap();
+        assert!(first.contains("use exactly this spelling): Valorant\n") && first.contains("keep it funny") && first.contains("vertical YouTube Short") && first.contains("0: at 0:00, enemy rush") && first.contains("1: at 0:31"), "{first}");
+        assert_eq!(content.iter().filter(|c| c["type"] == "input_image").count(), 2);
+        // The rules are not repeated in the data part.
+        assert!(!first.contains("primary keyword"));
+        // A missing game is said plainly, so the AI doesn't invent one.
+        let no_topic = pack_body("m", &PackRequest { topic: "", notes: "", ..req }).unwrap();
+        let text = no_topic["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("(use exactly this spelling): not given") && text.contains("notes: none"), "{text}");
+        assert_eq!(body["text"]["format"]["strict"], true);
+    }
+
     /// OpenAI's strict mode needs every property listed as required, at every level.
     fn assert_strict(schema: &Value) {
         if let Some(props) = schema["properties"].as_object() {
@@ -551,7 +654,9 @@ mod tests {
             "titles": ["One", "Two", "Three"], "intro": "Hi.",
             "chapter_titles": [{ "segment": 0, "title": "Start" }, { "segment": "x", "title": "bad" }, { "segment": 3, "title": "Boss" }],
             "hashtags": ["gaming"], "thumbnail": { "candidate": 2, "text": "WOW", "reason": "action" },
+            "primary_keyword": "Valorant clutch", "secondary_keywords": ["1v5", "ace"], "tags": ["valorant", "valorent"],
         })).unwrap();
+        assert_eq!((ai.primary_keyword.as_str(), ai.secondary_keywords.len(), ai.tags.len()), ("Valorant clutch", 2, 2));
         assert_eq!((ai.titles.len(), ai.chapter_titles.clone(), ai.thumb_candidate, ai.thumb_text.as_str()), (3, vec![(0, "Start".to_string()), (3, "Boss".to_string())], 2, "WOW"));
         let empty = parse_pack(&json!({})).unwrap();
         assert!(empty.titles.is_empty() && empty.chapter_titles.is_empty());

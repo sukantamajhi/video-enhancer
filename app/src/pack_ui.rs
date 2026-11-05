@@ -9,7 +9,7 @@ use eframe::egui::{self, Color32, RichText, vec2};
 use crate::grade::Grade;
 use crate::media::{self, Finish, GrabOptions};
 use crate::montage::{self, Cut, Style};
-use crate::pack::{self, Candidate, Pack, Segment};
+use crate::pack::{self, Candidate, Level, Pack, PackFormat, Segment};
 use crate::{App, Msg, ai, store};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,6 +157,7 @@ impl App {
             return;
         };
         let (model, notes, reuse, mail) = (ai::OPENAI_MODELS[self.openai_model].0, self.style_notes.clone(), self.reuse_ai, self.mail.clone());
+        let (topic, format) = (self.pack_topic.trim().to_string(), self.pack_format);
         self.pack_state(target).busy = Some("Writing your upload pack…".into());
         std::thread::spawn(move || {
             let work = std::env::temp_dir().join(format!("video-enhancer-pack-{}-{target:?}", std::process::id()));
@@ -168,19 +169,19 @@ impl App {
                     frames.push((c.label.clone(), media::grab_frame(&tools, &probe, &c.clip, c.t, &options)?));
                 }
                 // The same footage, moments and wording always make the same question, so its answer can be reused.
-                let mut facts = vec!["pack".to_string(), model.to_string(), request.kind.clone(), format!("{:.1}", request.duration), notes.trim().to_string()];
+                let mut facts = vec!["pack".to_string(), ai::PACK_PROMPT_VERSION.to_string(), model.to_string(), request.kind.clone(), format!("{:.1}", request.duration), notes.trim().to_string(), topic.clone(), format.name().to_string()];
                 facts.extend(request.segments.iter().map(|s| format!("{:.1}|{}", s.at, s.note)));
                 facts.extend(request.candidates.iter().map(|c| format!("{}|{:.2}|{}", store::fingerprint(&c.clip), c.t, c.label)));
                 let cache = format!("ai-pack-{}", store::hash(&facts));
                 let (answer, reused) = match reuse.then(|| store::load::<ai::AiPack>(&cache)).flatten() {
                     Some(saved) => (saved, true),
                     None => {
-                        let fresh = ai::openai_pack(&key, model, &ai::PackRequest { kind: &request.kind, duration: request.duration, notes: &notes, segments: &request.segments, frames: &frames })?;
+                        let fresh = ai::openai_pack(&key, model, &ai::PackRequest { kind: &request.kind, duration: request.duration, notes: &notes, topic: &topic, format, segments: &request.segments, frames: &frames })?;
                         store::save(&cache, &fresh);
                         (fresh, false)
                     }
                 };
-                let pack = Pack::assemble(&answer, &request.segments, request.candidates.clone(), request.credit.clone())?;
+                let pack = Pack::assemble(&answer, &request.segments, request.candidates.clone(), request.credit.clone(), format)?;
                 let jpeg = pack::render_thumbnail(&tools, &pack.candidates[pack.thumb_pick], &pack.thumb_text, &work)?;
                 Ok((pack, jpeg, reused))
             })();
@@ -274,6 +275,16 @@ impl App {
                 ui.label(text);
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Game or topic");
+            ui.add(egui::TextEdit::singleline(&mut self.pack_topic).hint_text("for example Valorant").desired_width(170.0))
+                .on_hover_text("The game's exact name is the strongest search keyword for a gaming video, and it is used exactly as you type it. Leave it empty and the AI names a game only if it can clearly see which one.");
+            egui::ComboBox::from_id_salt(("pack_format", target as u8)).selected_text(self.pack_format.name()).show_ui(ui, |ui| {
+                for f in PackFormat::ALL {
+                    ui.selectable_value(&mut self.pack_format, f, f.name());
+                }
+            });
+        });
         if !has_key {
             ui.label(RichText::new("Needs your OpenAI key (AI helpers section).").weak().small());
         }
@@ -312,6 +323,32 @@ impl App {
                     ui.label(RichText::new("Too short for chapters (YouTube needs 3, each 10 s or more).").weak().small());
                 }
             });
+
+            if !pack.primary_keyword.is_empty() {
+                let related = if pack.secondary_keywords.is_empty() { "none".to_string() } else { pack.secondary_keywords.join(", ") };
+                ui.label(RichText::new(format!("Focus keyword: {}    Related: {related}", pack.primary_keyword)).weak().small());
+            }
+            if !pack.tags.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Tags ({}): {}", pack.tags.len(), pack.tags.join(", "))).weak().small());
+                    if ui.small_button("Copy tags").clicked() {
+                        copy = Some(pack.tags.join(", "));
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new("Search check (updates as you edit)").weak().small());
+            for check in pack.seo_checks() {
+                let (word, colour) = match check.level {
+                    Level::Good => ("OK", Color32::from_rgb(110, 200, 120)),
+                    Level::Warn => ("Check", Color32::from_rgb(235, 190, 80)),
+                    Level::Bad => ("Fix", Color32::from_rgb(255, 120, 110)),
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(word).color(colour).strong().small());
+                    ui.label(RichText::new(check.text).small());
+                });
+            }
 
             ui.add_space(4.0);
             ui.label(RichText::new("Thumbnail").weak().small());

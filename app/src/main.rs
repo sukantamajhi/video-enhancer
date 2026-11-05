@@ -129,6 +129,8 @@ struct Settings {
     out_dir: Option<PathBuf>,
     encoder: EncoderChoice,
     gpu_grade: bool,
+    pack_topic: String,
+    pack_format: pack::PackFormat,
 }
 
 impl Default for Settings {
@@ -147,6 +149,8 @@ impl Default for Settings {
             out_dir: None,
             encoder: EncoderChoice::Auto,
             gpu_grade: true,
+            pack_topic: String::new(),
+            pack_format: pack::PackFormat::Standard,
         }
     }
 }
@@ -225,6 +229,8 @@ struct App {
     encoder_choice: EncoderChoice,
     gpu_grade: bool,
     gpu_status: Option<Result<String, String>>,
+    pack_topic: String,
+    pack_format: pack::PackFormat,
     encode_info: String,
     blur: BlurLayout,
     reuse_ai: bool,
@@ -318,6 +324,8 @@ impl App {
             encoder_choice: EncoderChoice::Auto,
             gpu_grade: true,
             gpu_status: None,
+            pack_topic: String::new(),
+            pack_format: pack::PackFormat::Standard,
             encode_info: String::new(),
             blur: BlurLayout::default(),
             reuse_ai: true,
@@ -369,6 +377,8 @@ impl App {
             out_dir: self.out_dir.clone(),
             encoder: self.encoder_choice,
             gpu_grade: self.gpu_grade,
+            pack_topic: self.pack_topic.clone(),
+            pack_format: self.pack_format,
         }
     }
 
@@ -405,6 +415,8 @@ impl App {
             self.out_dir = s.out_dir.filter(|d| d.is_dir());
             self.encoder_choice = s.encoder;
             self.gpu_grade = s.gpu_grade;
+            self.pack_topic = s.pack_topic;
+            self.pack_format = s.pack_format;
             if std::env::var_os("VE_MONTAGE").is_none() && s.montage {
                 self.mode = Mode::Montage;
             }
