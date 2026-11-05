@@ -66,6 +66,11 @@ pub struct Pack {
     pub ai_wide: Option<String>,
     #[serde(default)]
     pub ai_tall: Option<String>,
+    /// How the words look on each thumbnail. None means the default for that shape.
+    #[serde(default)]
+    pub style_wide: Option<TextStyle>,
+    #[serde(default)]
+    pub style_tall: Option<TextStyle>,
     pub reason: String,
     pub candidates: Vec<Candidate>,
     /// The music credit, when the video uses music that asks for one.
@@ -215,6 +220,23 @@ pub fn build_chapters(segments: &[Segment], titles: &HashMap<usize, String>) -> 
 }
 
 impl Pack {
+    /// The look of the words for a shape.
+    pub fn style(&self, shape: ThumbShape) -> TextStyle {
+        match shape {
+            ThumbShape::Wide => self.style_wide.clone(),
+            ThumbShape::Tall => self.style_tall.clone(),
+        }
+        .unwrap_or_else(|| TextStyle::default_for(shape))
+        .clamped()
+    }
+
+    pub fn set_style(&mut self, shape: ThumbShape, style: TextStyle) {
+        match shape {
+            ThumbShape::Wide => self.style_wide = Some(style.clamped()),
+            ThumbShape::Tall => self.style_tall = Some(style.clamped()),
+        }
+    }
+
     /// Builds the pack from what the AI said, the real chapter moments and the frames on offer.
     pub fn assemble(ai: &AiPack, segments: &[Segment], candidates: Vec<Candidate>, credit: String, format: PackFormat) -> Result<Pack, String> {
         let titles = clean_titles(&ai.titles);
@@ -245,6 +267,8 @@ impl Pack {
             thumb_note: String::new(),
             ai_wide: None,
             ai_tall: None,
+            style_wide: None,
+            style_tall: None,
             reason: tidy(&ai.reason, 240),
             candidates,
             credit,
@@ -423,18 +447,136 @@ fn font_size_for(wrapped: &str, shape: ThumbShape) -> u32 {
     ((across / (0.52 * longest)).min(tallest / lines.sqrt())).max(40.0) as u32
 }
 
-/// Draws a thumbnail: the chosen frame in the video's own colour with extra punch,
-/// and big bold text with a dark outline. Wide is 1280x720 for YouTube. Tall is
-/// 1080x1920 for a Short, cut out of the frame at `x` (0 left, 1 right), with the
-/// text in the middle band where the Shorts buttons and title don't cover it.
-/// Returns the JPEG.
+/// How the words on a thumbnail look and where they sit. Each shape keeps its own, because a Short
+/// needs its words in a different place from a wide thumbnail.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextStyle {
+    /// Where the middle of the words sits, as a share of the picture: 0 is the left / top edge, 1 the right / bottom.
+    pub x: f32,
+    pub y: f32,
+    /// 1 is the size that just fits the picture. Smaller and larger are allowed, but never wider than the picture.
+    pub size: f32,
+    pub fill: [u8; 3],
+    pub outline: [u8; 3],
+    /// 1 is the usual outline, 0 none, 2 twice as thick.
+    pub outline_width: f32,
+    pub shadow: bool,
+    /// How dark the soft shade behind the words is, 0 to 1.
+    pub shade: f32,
+    pub font: String,
+    /// 0 lets the app decide, 1 forces one line, 2 forces two.
+    pub lines: u8,
+}
+
+impl TextStyle {
+    pub fn default_for(shape: ThumbShape) -> Self {
+        Self {
+            x: 0.5,
+            y: if shape == ThumbShape::Wide { 0.84 } else { 0.60 },
+            size: 1.0,
+            fill: [0xFF, 0xE2, 0x00],
+            outline: [0, 0, 0],
+            outline_width: 1.0,
+            shadow: true,
+            shade: 0.7,
+            font: "Impact".into(),
+            lines: 0,
+        }
+    }
+
+    /// Keeps every value in the range the drawing can use, so a saved or typed value can't break a thumbnail.
+    pub fn clamped(mut self) -> Self {
+        self.x = self.x.clamp(0.0, 1.0);
+        self.y = self.y.clamp(0.0, 1.0);
+        self.size = self.size.clamp(0.4, 1.8);
+        self.outline_width = self.outline_width.clamp(0.0, 2.5);
+        self.shade = self.shade.clamp(0.0, 1.0);
+        self.lines = self.lines.min(2);
+        self
+    }
+}
+
+/// Fonts that make heavy thumbnail lettering, as (name shown, file name). Only the ones this computer has are offered.
+const FONT_FILES: [(&str, &str); 4] = [("Impact", "impact.ttf"), ("Arial Black", "ariblk.ttf"), ("Arial Bold", "arialbd.ttf"), ("Segoe UI Black", "seguibl.ttf")];
+
+pub fn available_fonts() -> &'static [String] {
+    static FOUND: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        let dir = std::env::var_os("WINDIR").map(|w| Path::new(&w).join("Fonts"));
+        let mut found: Vec<String> = FONT_FILES.iter().filter(|(_, file)| dir.as_ref().is_some_and(|d| d.join(file).is_file())).map(|(name, _)| name.to_string()).collect();
+        if found.is_empty() && bold_font().is_some() {
+            found.push("Impact".into());
+        }
+        found
+    })
+}
+
+fn font_file(name: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os("WINDIR").map(|w| Path::new(&w).join("Fonts"));
+    FONT_FILES.iter().find(|(n, _)| *n == name).and_then(|(_, file)| dir.map(|d| d.join(file))).filter(|p| p.is_file()).or_else(bold_font)
+}
+
+/// How wide a letter is compared with the font size, on average. Impact is narrow; the others are wide.
+fn letter_width(font: &str) -> f32 {
+    if font == "Impact" { 0.52 } else { 0.70 }
+}
+
+/// The words as drawn: where the lines break, the font size in pixels, and the size of the block in pixels.
+pub struct Layout {
+    pub wrapped: String,
+    pub size: u32,
+    pub width: f32,
+    pub height: f32,
+}
+
+pub fn text_layout(text: &str, shape: ThumbShape, style: &TextStyle) -> Layout {
+    let style = style.clone().clamped();
+    let text = clean_thumb_text(text);
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let wrapped = match style.lines {
+        1 => words.join(" "),
+        2 if words.len() >= 2 => {
+            let i = (1..words.len()).min_by_key(|&i| (words[..i].join(" ").chars().count() as i32 - words[i..].join(" ").chars().count() as i32).abs()).unwrap_or(1);
+            format!("{}\n{}", words[..i].join(" "), words[i..].join(" "))
+        }
+        _ => wrap_thumb_text(&text),
+    };
+    let lines = wrapped.lines().count().max(1) as f32;
+    let longest = wrapped.lines().map(|l| l.chars().count()).max().unwrap_or(1).max(1) as f32;
+    let factor = letter_width(&style.font);
+    let (w, _) = shape.size();
+    let fit = font_size_for(&wrapped, shape) as f32 * 0.52 / factor;
+    // Never wider than the picture, however large the slider.
+    let widest = (w as f32 * 0.92) / (factor * longest);
+    let size = (fit * style.size).min(widest).max(24.0);
+    Layout { wrapped, size: size as u32, width: longest * size * factor, height: lines * size * 1.05 }
+}
+
+/// Where the middle of the words really sits: the chosen spot, nudged so the whole block stays inside the margin.
+pub fn text_centre(layout: &Layout, shape: ThumbShape, style: &TextStyle) -> (f32, f32) {
+    let style = style.clone().clamped();
+    let (w, h) = (shape.size().0 as f32, shape.size().1 as f32);
+    let m = w * 0.04;
+    let cx = (style.x * w).clamp(m + layout.width / 2.0, (w - m - layout.width / 2.0).max(m + layout.width / 2.0));
+    let cy = (style.y * h).clamp(m + layout.height / 2.0, (h - m - layout.height / 2.0).max(m + layout.height / 2.0));
+    (cx, cy)
+}
+
+/// Draws a thumbnail with the default look of its shape. See `render_styled`.
 pub fn render_thumbnail(tools: &Tools, candidate: &Candidate, text: &str, workdir: &Path, shape: ThumbShape, x: f32) -> Result<Vec<u8>, String> {
+    render_styled(tools, candidate, text, workdir, shape, x, &TextStyle::default_for(shape))
+}
+
+/// Draws a thumbnail: the chosen frame in the video's own colour with extra punch, and the words
+/// in the style given. Wide is 1280x720 for YouTube. Tall is 1080x1920 for a Short, cut out of the
+/// frame at `x` (0 left, 1 right). Returns the JPEG.
+pub fn render_styled(tools: &Tools, candidate: &Candidate, text: &str, workdir: &Path, shape: ThumbShape, x: f32, style: &TextStyle) -> Result<Vec<u8>, String> {
     std::fs::create_dir_all(workdir).map_err(|e| e.to_string())?;
     let probe = media::probe(tools, &candidate.clip)?;
     Lut::build(LUT_SIZE, &candidate.grade, candidate.learned.as_ref()).write_cube(&workdir.join("thumb.cube")).map_err(|e| e.to_string())?;
-    let text = clean_thumb_text(text);
-    let wrapped = wrap_thumb_text(&text);
-    let font = bold_font().filter(|_| !wrapped.is_empty());
+    let style = style.clone().clamped();
+    let layout = text_layout(text, shape, &style);
+    let font = font_file(&style.font).filter(|_| !layout.wrapped.is_empty());
     let (w, h) = shape.size();
 
     let mut chain = cover_chain(&probe, w, h, shape == ThumbShape::Tall, x);
@@ -445,17 +587,22 @@ pub fn render_thumbnail(tools: &Tools, candidate: &Candidate, text: &str, workdi
     chain.push("vignette=angle=0.5".into());
     if let Some(font) = font {
         std::fs::copy(font, workdir.join("font.ttf")).map_err(|e| e.to_string())?;
-        std::fs::write(workdir.join("thumb.txt"), &wrapped).map_err(|e| e.to_string())?;
-        let size = font_size_for(&wrapped, shape);
-        let border = (size / 13).max(4);
+        std::fs::write(workdir.join("thumb.txt"), &layout.wrapped).map_err(|e| e.to_string())?;
+        let (cx, cy) = text_centre(&layout, shape, &style);
+        let m = w as f32 * 0.04;
         // A soft shade behind the words, fading in and out, in place of a hard-edged box. Only the brightness changes.
-        let (scrim, y) = match shape {
-            ThumbShape::Wide => ("min(1,max(0,(Y/H-0.45)/0.30))", "h-text_h-64"),
-            ThumbShape::Tall => ("min(1,max(0,(Y/H-0.36)/0.12))*min(1,max(0,(0.82-Y/H)/0.10))", "h*0.46+(h*0.30-text_h)/2"),
-        };
-        chain.push(format!("geq=lum='lum(X,Y)*(1-0.5*{scrim})':cb='cb(X,Y)':cr='cr(X,Y)'"));
+        if style.shade > 0.01 {
+            let (half, feather) = (layout.height * 0.55, layout.height * 0.5);
+            chain.push(format!("geq=lum='lum(X,Y)*(1-{:.3}*min(1,max(0,1-(abs(Y-{cy:.1})-{half:.1})/{feather:.1})))':cb='cb(X,Y)':cr='cr(X,Y)'", 0.7 * style.shade));
+        }
+        let hex = |c: [u8; 3]| format!("0x{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+        let border = (layout.size as f32 / 13.0 * style.outline_width).round() as u32;
+        let shadow = if style.shadow { format!(":shadowcolor=black@0.7:shadowx={0}:shadowy={0}", (layout.size / 30).max(3)) } else { String::new() };
         chain.push(format!(
-            "drawtext=fontfile=font.ttf:textfile=thumb.txt:fontsize={size}:fontcolor=0xFFE200:borderw={border}:bordercolor=black:shadowcolor=black@0.7:shadowx=7:shadowy=7:line_spacing=-6:x=(w-text_w)/2:y={y}"
+            "drawtext=fontfile=font.ttf:textfile=thumb.txt:fontsize={}:fontcolor={}:borderw={border}:bordercolor={}{shadow}:line_spacing=-6:x='max({m:.0},min(w-{m:.0}-text_w,{cx:.1}-text_w/2))':y='max({m:.0},min(h-{m:.0}-text_h,{cy:.1}-text_h/2))'",
+            layout.size,
+            hex(style.fill),
+            hex(style.outline),
         ));
     }
     run_chain(tools, candidate, &chain, workdir)
@@ -630,7 +777,7 @@ mod tests {
         let band = |img: &image::RgbImage, from: u32, to: u32| img.enumerate_pixels().filter(|(_, y, _)| *y >= from && *y < to).map(|(_, _, p)| p[0] as u64 + p[1] as u64).sum::<u64>();
         let (a, b) = (rgb(&plain), rgb(&texted));
         assert!(bold_font().is_none() || band(&b, 900, 1400) != band(&a, 900, 1400), "no text in the middle band");
-        assert_eq!(band(&b, 1620, 1920), band(&a, 1620, 1920), "text or shade spilled into the bottom of the Short");
+        assert_eq!(band(&b, 1720, 1920), band(&a, 1720, 1920), "text or shade spilled into the bottom of the Short");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -656,6 +803,107 @@ mod tests {
         let plain = render_thumbnail(&tools, &candidate(&clip, 2.0), "insane clutch", &dir.join("p"), ThumbShape::Wide, 0.5).unwrap();
         assert_ne!(rgb(&wide).as_raw()[..1000], rgb(&plain).as_raw()[..1000]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_style_of_the_words_really_changes_the_thumbnail() {
+        let Some(tools) = Tools::find() else { return };
+        if bold_font().is_none() {
+            return;
+        }
+        let dir = scratch("text-style");
+        let clip = dir.join("clip.mp4");
+        make_video(&tools, &clip, "1920x1080", 6);
+        let draw = |name: &str, shape: ThumbShape, text: &str, edit: &dyn Fn(&mut TextStyle)| {
+            let mut style = TextStyle::default_for(shape);
+            edit(&mut style);
+            let bytes = render_styled(&tools, &candidate(&clip, 2.0), text, &dir.join(name), shape, 0.5, &style).unwrap();
+            image::load_from_memory(&bytes).unwrap().to_rgb8()
+        };
+        let close = |p: &image::Rgb<u8>, c: [u8; 3]| (0..3).all(|i| (p[i] as i32 - c[i] as i32).abs() < 40);
+        // The pixels that are the colour `c` now but weren't in the same picture without words: count, and where they are on average.
+        let lettering = |img: &image::RgbImage, plain: &image::RgbImage, c: [u8; 3]| -> (u64, f64, f64) {
+            let (mut n, mut sx, mut sy) = (0u64, 0f64, 0f64);
+            for (x, y, p) in img.enumerate_pixels() {
+                if close(p, c) && !close(plain.get_pixel(x, y), c) {
+                    n += 1;
+                    sx += x as f64;
+                    sy += y as f64;
+                }
+            }
+            (n, sx / n.max(1) as f64, sy / n.max(1) as f64)
+        };
+        let yellow = [0xFF, 0xE2, 0x00];
+        let plain_wide = draw("plain", ThumbShape::Wide, "", &|_| {});
+        let base = lettering(&draw("base", ThumbShape::Wide, "ace", &|_| {}), &plain_wide, yellow);
+        assert!(base.0 > 500, "the default lettering should be there: {}", base.0);
+        assert!(base.2 > 480.0, "the default sits in the lower part: {base:?}");
+        // Position: moved to the top and to the left.
+        let top_left = lettering(&draw("tl", ThumbShape::Wide, "ace", &|s| (s.x, s.y) = (0.15, 0.12)), &plain_wide, yellow);
+        assert!(top_left.2 < base.2 - 250.0 && top_left.1 < base.1 - 300.0, "{top_left:?} vs {base:?}");
+        // Size: smaller and larger.
+        let small = lettering(&draw("small", ThumbShape::Wide, "ace", &|s| s.size = 0.5), &plain_wide, yellow).0;
+        let large = lettering(&draw("large", ThumbShape::Wide, "ace", &|s| s.size = 1.4), &plain_wide, yellow).0;
+        assert!(small * 2 < base.0 && large > base.0, "small {small}, base {}, large {large}", base.0);
+        // Colour: the lettering follows the fill colour.
+        let red = [0xFF, 0x20, 0x20];
+        let recoloured = draw("red", ThumbShape::Wide, "ace", &|s| s.fill = red);
+        assert!(lettering(&recoloured, &plain_wide, red).0 > 300 && lettering(&recoloured, &plain_wide, yellow).0 < base.0 / 20);
+        // The outline can be switched off.
+        let black = [0, 0, 0];
+        let no_outline = lettering(&draw("noline", ThumbShape::Wide, "ace", &|s| (s.outline_width, s.shadow) = (0.0, false)), &plain_wide, black).0;
+        let outline = lettering(&draw("line", ThumbShape::Wide, "ace", &|s| s.outline_width = 1.0), &plain_wide, black).0;
+        assert!(outline > no_outline + 500, "{outline} vs {no_outline}");
+        // A Short can have its words near the top, and a huge size still stays inside the picture.
+        let plain_tall = draw("plain-tall", ThumbShape::Tall, "", &|_| {});
+        let tall = draw("tall", ThumbShape::Tall, "insane clutch", &|s| (s.y, s.size) = (0.2, 1.8));
+        let (n, cx, cy) = lettering(&tall, &plain_tall, yellow);
+        assert!(n > 500 && cy < 700.0 && (300.0..780.0).contains(&cx), "{n} {cx} {cy}");
+        for x in (0..24).chain(1056..1080) {
+            assert!((0..1920).all(|y| !(close(tall.get_pixel(x, y), yellow) && !close(plain_tall.get_pixel(x, y), yellow))), "lettering touched the edge at column {x}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_layout_follows_the_style_and_stays_inside_the_picture() {
+        let style = TextStyle::default_for(ThumbShape::Wide);
+        let auto = text_layout("insane clutch", ThumbShape::Wide, &style);
+        assert!(auto.wrapped.contains('\n'));
+        let one = text_layout("insane clutch", ThumbShape::Wide, &TextStyle { lines: 1, ..style.clone() });
+        assert!(!one.wrapped.contains('\n') && one.width > auto.width, "{} vs {}", one.width, auto.width);
+        let forced = text_layout("big win", ThumbShape::Wide, &TextStyle { lines: 2, ..style.clone() });
+        assert_eq!(forced.wrapped, "BIG\nWIN");
+        assert_eq!(text_layout("ace", ThumbShape::Wide, &TextStyle { lines: 2, ..style.clone() }).wrapped, "ACE", "one word can't be split");
+        let bigger = text_layout("ace", ThumbShape::Wide, &TextStyle { size: 1.4, ..style.clone() });
+        let smaller = text_layout("ace", ThumbShape::Wide, &TextStyle { size: 0.6, ..style.clone() });
+        assert!(smaller.size < bigger.size);
+        // Never wider than the picture, and a wide font gets a smaller size for the same words.
+        for size in [1.0, 1.8, 99.0] {
+            let l = text_layout("insane clutch now", ThumbShape::Wide, &TextStyle { size, lines: 1, ..style.clone() });
+            assert!(l.width <= 1280.0 * 0.93, "{} wide at size {size}", l.width);
+        }
+        let wide_font = text_layout("insane clutch", ThumbShape::Wide, &TextStyle { font: "Arial Black".into(), ..style.clone() });
+        assert!(wide_font.size < auto.size);
+        // The centre is nudged in so the block keeps its margin, whatever was asked.
+        let corner = TextStyle { x: 0.0, y: 1.0, ..style.clone() };
+        let l = text_layout("insane clutch", ThumbShape::Wide, &corner);
+        let (cx, cy) = text_centre(&l, ThumbShape::Wide, &corner);
+        assert!(cx - l.width / 2.0 >= 50.0 && cy + l.height / 2.0 <= 720.0 - 50.0, "{cx} {cy}");
+        // Wild values are brought back into range.
+        let wild = TextStyle { x: -3.0, y: 9.0, size: 50.0, outline_width: -1.0, shade: 4.0, lines: 9, ..style }.clamped();
+        assert_eq!((wild.x, wild.y, wild.size, wild.outline_width, wild.shade, wild.lines), (0.0, 1.0, 1.8, 0.0, 1.0, 2));
+    }
+
+    #[test]
+    fn a_pack_saved_before_styles_existed_still_opens_and_each_shape_keeps_its_own_look() {
+        let mut p: Pack = serde_json::from_str(r#"{"titles":["A"],"title_pick":0,"intro":"","chapters":[],"hashtags":[],"thumb_text":"ACE","thumb_pick":0,"reason":"","candidates":[],"credit":""}"#).unwrap();
+        assert_eq!(p.style(ThumbShape::Tall), TextStyle::default_for(ThumbShape::Tall));
+        assert!(p.style(ThumbShape::Tall).y < p.style(ThumbShape::Wide).y, "a Short's words sit higher than a wide thumbnail's");
+        p.set_style(ThumbShape::Wide, TextStyle { size: 1.3, ..p.style(ThumbShape::Wide) });
+        let back: Pack = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.style(ThumbShape::Wide).size, 1.3);
+        assert_eq!(back.style(ThumbShape::Tall).size, 1.0);
     }
 
     fn pack(title: &str, intro: &str) -> Pack {

@@ -9,7 +9,7 @@ use eframe::egui::{self, Frame, Margin, RichText, Sense, Stroke, vec2};
 use crate::grade::Grade;
 use crate::media::{self, Finish, GrabOptions};
 use crate::montage::{self, Cut, Style};
-use crate::pack::{self, Candidate, Level, Pack, PackFormat, Segment, ThumbShape};
+use crate::pack::{self, Candidate, Level, Pack, PackFormat, Segment, TextStyle, ThumbShape};
 use crate::theme::{self, Icon, Kind};
 use crate::thumb_ai;
 use crate::{App, Msg, Step, ai, store};
@@ -60,6 +60,8 @@ pub struct PackState {
     pub view_tall: bool,
     /// The crop slider moved and the picture hasn't been redrawn yet.
     pub tall_dirty: bool,
+    /// A look control moved and the plain thumbnail hasn't been redrawn yet.
+    pub style_dirty: bool,
     /// While the AI is designing the thumbnails: what it is doing.
     pub ai_busy: Option<String>,
     pub ai_pending: u8,
@@ -274,6 +276,7 @@ impl App {
         let st = self.pack_state(target);
         let Some(pack) = &st.pack else { return };
         let (candidate, text, x) = (pack.candidates.get(pack.thumb_pick).cloned(), pack.thumb_text.clone(), pack.thumb_x.unwrap_or(0.5));
+        let styles = (pack.style(ThumbShape::Wide), pack.style(ThumbShape::Tall));
         let Some(candidate) = candidate else { return };
         if let Some(p) = &mut st.pack {
             for shape in &shapes {
@@ -293,7 +296,8 @@ impl App {
         std::thread::spawn(move || {
             let work = std::env::temp_dir().join(format!("video-enhancer-thumb-{}-{target:?}", std::process::id()));
             for shape in shapes {
-                let result = pack::render_thumbnail(&tools, &candidate, &text, &work, shape, x);
+                let style = if shape == ThumbShape::Wide { &styles.0 } else { &styles.1 };
+                let result = pack::render_styled(&tools, &candidate, &text, &work, shape, x, style);
                 mail.send(Msg::Pack(Event::Thumb(target, shape, result)));
             }
             std::fs::remove_dir_all(&work).ok();
@@ -315,12 +319,14 @@ impl App {
         }
         let Some(pack) = &st.pack else { return };
         let Some(candidate) = pack.candidates.get(pack.thumb_pick).cloned() else { return };
-        let brief = thumb_ai::Brief { text: pack::clean_thumb_text(&pack.thumb_text), topic, direction: pack.thumb_note.clone(), format: pack.format };
+        let brief = thumb_ai::Brief { text: pack::clean_thumb_text(&pack.thumb_text), topic, direction: pack.thumb_note.clone(), format: pack.format, style: TextStyle::default_for(ThumbShape::Wide) };
+        let styles = (pack.style(ThumbShape::Wide), pack.style(ThumbShape::Tall));
         let x = pack.thumb_x.unwrap_or(0.5);
         (st.ai_busy, st.ai_pending, st.ai_cost, st.ai_reused, st.thumb_error) = (Some("Getting the frames ready…".into()), 2, 0.0, false, None);
         st.ai_warnings.clear();
         for shape in [ThumbShape::Wide, ThumbShape::Tall] {
-            let (tools, key, candidate, brief, mail) = (tools.clone(), key.clone(), candidate.clone(), brief.clone(), mail.clone());
+            let (tools, key, candidate, mut brief, mail) = (tools.clone(), key.clone(), candidate.clone(), brief.clone(), mail.clone());
+            brief.style = if shape == ThumbShape::Wide { styles.0.clone() } else { styles.1.clone() };
             let (model, quality, text_model) = (model.to_string(), quality.to_string(), text_model.to_string());
             std::thread::spawn(move || {
                 let work = std::env::temp_dir().join(format!("video-enhancer-ai-thumb-{}-{target:?}-{shape:?}", std::process::id()));
@@ -443,6 +449,10 @@ impl App {
                     let released = !ui.input(|i| i.pointer.any_down());
                     let mut changed_x = false;
                     let mut ask_ai = false;
+                    let mut style_changed = false;
+                    let mut style_designed = false;
+                    let mut redraw_both = false;
+                    let mut view_shape = ThumbShape::Wide;
                     let Some(pack) = &mut st.pack else { return };
                     let checks = pack.seo_checks();
                     let good = checks.iter().filter(|c| c.level == Level::Good).count();
@@ -453,28 +463,52 @@ impl App {
                                 theme::segmented(ui, &mut view_tall, &[(true, "9:16 Short"), (false, "16:9 video")], false);
                             });
                         });
+                        let shape = if view_tall { ThumbShape::Tall } else { ThumbShape::Wide };
+                        let mut style = pack.style(shape);
+                        let before = style.clone();
+                        let designed = if view_tall { pack.ai_tall.is_some() } else { pack.ai_wide.is_some() };
+                        view_shape = shape;
+                        style_designed = designed;
+
+                        // The picture. On a free draft the words can be dragged to where they should sit.
                         let width = ui.available_width();
                         let shown = if view_tall { &tex_tall } else { &tex };
+                        let region = if view_tall { 420.0 } else { width * 9.0 / 16.0 };
+                        let (rect, response) = ui.allocate_exact_size(vec2(width, region), Sense::click_and_drag());
+                        ui.painter().rect_filled(rect, 10, theme::INPUT);
+                        let r = if view_tall { egui::Rect::from_center_size(rect.center(), vec2(420.0 * 9.0 / 16.0, 420.0)) } else { rect };
+                        if let Some(tex) = shown {
+                            egui::Image::new(egui::load::SizedTexture::new(tex.id(), r.size())).corner_radius(10).paint_at(ui, r);
+                        } else if thumb_busy {
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drawing the thumbnail…", egui::FontId::proportional(14.0), theme::TEXT2);
+                        }
                         if view_tall {
-                            let (rect, _) = ui.allocate_exact_size(vec2(width, 420.0), Sense::hover());
-                            ui.painter().rect_filled(rect, 10, theme::INPUT);
-                            let r = egui::Rect::from_center_size(rect.center(), vec2(420.0 * 9.0 / 16.0, 420.0));
-                            if let Some(tex) = shown {
-                                egui::Image::new(egui::load::SizedTexture::new(tex.id(), r.size())).corner_radius(10).paint_at(ui, r);
-                            } else if thumb_busy {
-                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drawing the thumbnail…", egui::FontId::proportional(14.0), theme::TEXT2);
+                            // Shorts covers the top and the bottom of the picture with its title and buttons.
+                            let shade = egui::Color32::from_rgba_unmultiplied(255, 70, 60, 46);
+                            let (top, bottom) = (egui::Rect::from_min_size(r.min, vec2(r.width(), r.height() * 0.10)), egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - r.height() * 0.25), r.max));
+                            for zone in [top, bottom] {
+                                ui.painter().rect_filled(zone, 0, shade);
                             }
-                        } else {
-                            let (rect, _) = ui.allocate_exact_size(vec2(width, width * 9.0 / 16.0), Sense::hover());
-                            ui.painter().rect_filled(rect, 10, theme::INPUT);
-                            if let Some(tex) = shown {
-                                egui::Image::new(egui::load::SizedTexture::new(tex.id(), rect.size())).corner_radius(10).paint_at(ui, rect);
-                            } else if thumb_busy {
-                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drawing the thumbnail…", egui::FontId::proportional(14.0), theme::TEXT2);
+                            ui.painter().text(bottom.center(), egui::Align2::CENTER_CENTER, "Shorts covers this", egui::FontId::proportional(11.5), egui::Color32::from_rgba_unmultiplied(255, 200, 190, 200));
+                        }
+                        let words = pack.thumb_text.clone();
+                        if !designed && !words.is_empty() {
+                            let layout = pack::text_layout(&words, shape, &style);
+                            if let Some(p) = response.interact_pointer_pos().filter(|_| response.dragged() || response.clicked()) {
+                                style.x = ((p.x - r.left()) / r.width()).clamp(0.0, 1.0);
+                                style.y = ((p.y - r.top()) / r.height()).clamp(0.0, 1.0);
+                            }
+                            if response.hovered() || response.dragged() {
+                                ui.ctx().set_cursor_icon(if response.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+                                let (out_w, out_h) = (shape.size().0 as f32, shape.size().1 as f32);
+                                let (cx, cy) = pack::text_centre(&layout, shape, &style);
+                                let size = vec2(layout.width / out_w * r.width(), layout.height / out_h * r.height());
+                                let guide = egui::Rect::from_center_size(egui::pos2(r.left() + cx / out_w * r.width(), r.top() + cy / out_h * r.height()), size).expand(4.0);
+                                ui.painter().rect_stroke(guide, 4, Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Outside);
                             }
                         }
+
                         // A plain frame with words on it is only a draft. The AI design is the real thumbnail.
-                        let designed = if view_tall { pack.ai_tall.is_some() } else { pack.ai_wide.is_some() };
                         ui.horizontal(|ui| {
                             if designed {
                                 theme::pill(ui, "AI designed", theme::ACCENT_TEXT, theme::accent_soft(40), None);
@@ -496,22 +530,68 @@ impl App {
                                 pack.thumb_x = Some(x);
                                 changed_x = true;
                             }
-                            ui.label(theme::muted("The Short thumbnail is cut out of the wide frame. Slide it to keep the action in. The text sits in the middle band, clear of the Shorts buttons."));
+                            ui.label(theme::muted("The Short thumbnail is cut out of the wide frame. Slide it to keep the action in."));
                         }
                         if let Some(e) = &thumb_error {
                             ui.label(RichText::new(format!("The thumbnail couldn't be drawn: {e}")).color(theme::BAD).size(12.5));
                         }
                         ui.horizontal(|ui| {
                             ui.label(theme::soft("Words on it"));
-                            ui.add(egui::TextEdit::singleline(&mut pack.thumb_text).desired_width(ui.available_width() - 90.0).margin(Margin::symmetric(10, 8)));
+                            ui.add(egui::TextEdit::singleline(&mut pack.thumb_text).desired_width(ui.available_width() - 120.0).margin(Margin::symmetric(10, 8)));
                             ui.add_enabled_ui(!thumb_busy, |ui| {
                                 if theme::small_button(ui, "Redraw (free)").clicked() {
                                     action = Some(Action::Redraw);
                                 }
                             });
                         });
-                        ui.label(theme::muted("Pick the frame"));
+
+                        // How the words look. On a free draft the picture follows as soon as a control is let go.
+                        egui::CollapsingHeader::new(theme::bold("Words: place, size and colours", 13.5)).default_open(true).id_salt(("text-style", view_tall)).show(ui, |ui| {
+                            ui.label(theme::muted(if designed { "This is an AI design. These choices are sent to the AI the next time you press Design again." } else { "Drag the words on the picture, or use the controls. The picture redraws when you let go." }));
+                            theme::slider_row(ui, "Left / right", &mut style.x, 0.0..=1.0, 0.5, false);
+                            theme::slider_row(ui, "Up / down", &mut style.y, 0.0..=1.0, 0.5, false);
+                            theme::slider_row(ui, "Size", &mut style.size, 0.4..=1.8, 1.0, false);
+                            theme::slider_row(ui, "Outline thickness", &mut style.outline_width, 0.0..=2.5, 1.0, false);
+                            theme::slider_row(ui, "Shade behind the words", &mut style.shade, 0.0..=1.0, 0.0, false);
+                            swatches(ui, "Words", &mut style.fill, &[[0xFF, 0xE2, 0x00], [0xFF, 0xFF, 0xFF], [0xFF, 0x6B, 0x3D], [0x00, 0xE5, 0xFF], [0x7C, 0xFF, 0x4F], [0xFF, 0x3B, 0x30], [0xFF, 0x4F, 0xB8]]);
+                            swatches(ui, "Outline", &mut style.outline, &[[0, 0, 0], [0x0B, 0x1B, 0x3A], [0xFF, 0xFF, 0xFF], [0x4A, 0x00, 0x00]]);
+                            ui.horizontal(|ui| {
+                                let fonts = pack::available_fonts();
+                                ui.label(theme::soft("Font"));
+                                egui::ComboBox::from_id_salt("thumb_font").selected_text(style.font.clone()).width(140.0).show_ui(ui, |ui| {
+                                    for f in fonts {
+                                        ui.selectable_value(&mut style.font, f.clone(), f);
+                                    }
+                                });
+                                ui.label(theme::soft("Lines"));
+                                egui::ComboBox::from_id_salt("thumb_lines").selected_text(["Auto", "One line", "Two lines"][style.lines.min(2) as usize]).width(100.0).show_ui(ui, |ui| {
+                                    for (n, name) in ["Auto", "One line", "Two lines"].into_iter().enumerate() {
+                                        ui.selectable_value(&mut style.lines, n as u8, name);
+                                    }
+                                });
+                            });
+                            theme::checkbox(ui, &mut style.shadow, "Shadow behind the letters");
+                            ui.horizontal(|ui| {
+                                if theme::small_button(ui, "Reset").clicked() {
+                                    style = TextStyle::default_for(shape);
+                                }
+                                if theme::small_button(ui, "Use this look on both thumbnails").on_hover_text("Copies the font, size, colours and outline to the other thumbnail. Each keeps its own position.").clicked() {
+                                    let other = if view_tall { ThumbShape::Wide } else { ThumbShape::Tall };
+                                    let mut copy = pack.style(other);
+                                    (copy.size, copy.fill, copy.outline, copy.outline_width, copy.shadow, copy.shade, copy.font, copy.lines) = (style.size, style.fill, style.outline, style.outline_width, style.shadow, style.shade, style.font.clone(), style.lines);
+                                    pack.set_style(other, copy);
+                                    redraw_both = pack.ai_wide.is_none() && pack.ai_tall.is_none();
+                                }
+                            });
+                        });
+                        let style = style.clamped();
+                        if style != before {
+                            pack.set_style(shape, style);
+                            style_changed = true;
+                        }
+                        ui.add_space(2.0);
                         let count = pack.candidates.len();
+                        ui.label(theme::muted("Pick the frame"));
                         let gap = 6.0;
                         let chip = ((ui.available_width() - gap * 7.0) / 8.0).max(24.0);
                         ui.horizontal(|ui| {
@@ -614,6 +694,16 @@ impl App {
                         action = Some(Action::RedrawTall);
                     }
                     st.tall_dirty = dirty;
+                    // The look of the words: redraw the plain picture once the control is let go. An AI design is left alone.
+                    let mut style_dirty = st.style_dirty || (style_changed && !style_designed);
+                    if style_dirty && released && !st.thumb_busy && !st.tall_busy && action.is_none() {
+                        style_dirty = false;
+                        action = Some(Action::Restore(vec![view_shape]));
+                    }
+                    st.style_dirty = style_dirty;
+                    if redraw_both && action.is_none() {
+                        action = Some(Action::Restore(vec![ThumbShape::Wide, ThumbShape::Tall]));
+                    }
                 });
             });
         }
@@ -780,4 +870,27 @@ impl App {
             None => {}
         }
     }
+}
+
+/// A row of colour choices with a picker for any other colour. True when the colour changed.
+fn swatches(ui: &mut egui::Ui, label: &str, current: &mut [u8; 3], presets: &[[u8; 3]]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(theme::soft(label));
+        for preset in presets {
+            let (r, response) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+            ui.painter().circle_filled(r.center(), 10.0, egui::Color32::from_rgb(preset[0], preset[1], preset[2]));
+            if *current == *preset {
+                ui.painter().circle_stroke(r.center(), 12.0, Stroke::new(2.0, theme::ACCENT));
+            } else {
+                ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.0, theme::LINE_STRONG));
+            }
+            if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                *current = *preset;
+                changed = true;
+            }
+        }
+        changed |= ui.color_edit_button_srgb(current).changed();
+    });
+    changed
 }

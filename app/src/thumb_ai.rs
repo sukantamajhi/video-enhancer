@@ -18,7 +18,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
 use crate::ai;
-use crate::pack::{PackFormat, ThumbShape};
+use crate::pack::{PackFormat, TextStyle, ThumbShape, text_layout};
 use crate::store;
 
 pub const API: &str = "https://api.openai.com";
@@ -61,25 +61,54 @@ pub struct Brief {
     pub topic: String,
     pub direction: String,
     pub format: PackFormat,
+    /// Where, how big and in what colours the creator wants the words.
+    pub style: TextStyle,
 }
 
 fn one_line(text: &str, max: usize) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max).collect()
 }
 
+/// A plain name for a colour, so the instructions can say "bright yellow" as well as the hex code.
+fn colour_name(c: [u8; 3]) -> &'static str {
+    const NAMES: [(&str, [u8; 3]); 10] = [
+        ("bright yellow", [0xFF, 0xE2, 0x00]),
+        ("white", [0xFF, 0xFF, 0xFF]),
+        ("orange", [0xFF, 0x6B, 0x3D]),
+        ("cyan", [0x00, 0xE5, 0xFF]),
+        ("lime green", [0x7C, 0xFF, 0x4F]),
+        ("red", [0xFF, 0x3B, 0x30]),
+        ("pink", [0xFF, 0x4F, 0xB8]),
+        ("black", [0, 0, 0]),
+        ("dark navy blue", [0x0B, 0x1B, 0x3A]),
+        ("grey", [0x80, 0x80, 0x80]),
+    ];
+    let distance = |n: &[u8; 3]| (0..3).map(|i| (c[i] as i32 - n[i] as i32).pow(2)).sum::<i32>();
+    NAMES.iter().min_by_key(|(_, n)| distance(n)).map_or("yellow", |(name, _)| name)
+}
+
+fn hex(c: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+}
+
+/// Where the creator put the words, in plain language.
+fn position_words(style: &TextStyle) -> String {
+    let across = if style.x < 0.33 { "on the left" } else if style.x > 0.67 { "on the right" } else { "centred left to right" };
+    let down = if style.y < 0.33 { "in the upper third" } else if style.y < 0.67 { "in the middle band" } else { "in the lower third" };
+    format!("{down}, {across} (the middle of the words about {:.0}% across and {:.0}% down)", style.x * 100.0, style.y * 100.0)
+}
+
 /// The instructions that go with the frame. `misread` is what an earlier try spelled wrongly, if any.
+/// The creator's own choices for the words (place, size, colours, lines) are passed on as they are.
 pub fn prompt(shape: ThumbShape, brief: &Brief, misread: Option<&str>) -> String {
     let words = one_line(&brief.text, 40).to_uppercase().replace('"', "");
-    let lines = if words.chars().count() <= 11 || words.split_whitespace().count() < 2 { "one line" } else { "two lines" };
-    let (placement, composition) = match shape {
-        ThumbShape::Wide => (
-            "in the lower third or beside the action, wherever it covers the key moment least",
-            "This is a 16:9 landscape YouTube thumbnail. Make the key moment large, off-centre on a third, and readable at the size of a small phone thumbnail.",
-        ),
-        ThumbShape::Tall => (
-            "centred in the middle band of the picture, between 45% and 75% of its height. Keep the top 10% and the bottom 25% free of text and of anything important, because YouTube Shorts covers them with its title and buttons",
-            "This is a 9:16 portrait cover picture for a YouTube Short. Make the key moment large and in the upper-middle, and keep it readable at a small size.",
-        ),
+    let style = brief.style.clone().clamped();
+    let layout = text_layout(&words, shape, &style);
+    let lines = if layout.wrapped.lines().count() > 1 { "two lines" } else { "one line" };
+    let share = (layout.width / shape.size().0 as f32 * 100.0).round();
+    let composition = match shape {
+        ThumbShape::Wide => "This is a 16:9 landscape YouTube thumbnail. Make the key moment large, off-centre on a third, and readable at the size of a small phone thumbnail.",
+        ThumbShape::Tall => "This is a 9:16 portrait cover picture for a YouTube Short. Make the key moment large, and keep it readable at a small size. YouTube Shorts covers the top 10% and the bottom 25% of the picture with its title and buttons, so keep anything important out of those areas.",
     };
     let kind = match brief.format {
         PackFormat::Standard => "a normal YouTube video",
@@ -90,13 +119,25 @@ pub fn prompt(shape: ThumbShape, brief: &Brief, misread: Option<&str>) -> String
     let direction = one_line(&brief.direction, 300);
     let direction_line = if direction.is_empty() { String::new() } else { format!("\nThe creator also asks: {direction}. Follow this only where it does not break the rules above.") };
     let retry_line = misread.map_or(String::new(), |found| format!("\nIMPORTANT: a previous attempt spelled the lettering as \"{found}\", which is wrong. The lettering must read exactly \"{words}\", letter for letter."));
+    let outline = match style.outline_width {
+        w if w < 0.05 => "no outline".to_string(),
+        w if w < 0.6 => format!("a thin {} outline", colour_name(style.outline)),
+        w if w <= 1.4 => format!("a thick {} outline ({})", colour_name(style.outline), hex(style.outline)),
+        _ => format!("a very thick {} outline ({})", colour_name(style.outline), hex(style.outline)),
+    };
+    let shade = if style.shade > 0.3 { " A soft dark shade behind the words, fading out at its edges, may help them read." } else { "" };
+    let shadow = if style.shadow { " with a soft drop shadow" } else { "" };
     let lettering = if words.is_empty() {
         "Do not add any text or lettering to the picture.".to_string()
     } else {
         format!(
             "Write exactly this lettering, once: \"{words}\". Copy every letter exactly as given, in capitals, on {lines}. Write no other words or letters anywhere. \
-             Use very large, heavy, clean sans-serif lettering in the style of Impact: bright yellow or white fill with a thick black outline and a soft shadow, so it is easy to read on any background. \
-             Keep every letter fully inside the picture with at least 6% of empty margin from each edge. Place it {placement}."
+             Use heavy, clean sans-serif lettering in the style of {font}, about {share}% of the picture's width, with a {fill} fill ({fill_hex}), {outline}{shadow}, so it is easy to read on any background.{shade} \
+             Keep every letter fully inside the picture with at least 4% of empty margin from each edge. These choices are the creator's, so follow them. Place the lettering {position}.",
+            font = style.font,
+            fill = colour_name(style.fill),
+            fill_hex = hex(style.fill),
+            position = position_words(&style),
         )
     };
     format!(
@@ -258,7 +299,7 @@ pub struct Made {
 /// The name a result is saved under: the same frame, words, wishes, model and quality always give the same name.
 pub fn cache_name(job: &Job) -> String {
     let shape = if job.shape == ThumbShape::Wide { "wide" } else { "tall" };
-    let facts = [PROMPT_VERSION.to_string(), job.model.clone(), job.quality.clone(), shape.to_string(), job.brief.text.clone(), job.brief.topic.clone(), job.brief.direction.clone(), job.brief.format.name().to_string(), store::hash_bytes(&job.frame)];
+    let facts = [PROMPT_VERSION.to_string(), job.model.clone(), job.quality.clone(), shape.to_string(), job.brief.text.clone(), job.brief.topic.clone(), job.brief.direction.clone(), job.brief.format.name().to_string(), serde_json::to_string(&job.brief.style).unwrap_or_default(), store::hash_bytes(&job.frame)];
     format!("ai-thumb-{}", store::hash(&facts))
 }
 
@@ -330,7 +371,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn brief(text: &str) -> Brief {
-        Brief { text: text.into(), topic: "Valorant".into(), direction: String::new(), format: PackFormat::Standard }
+        Brief { text: text.into(), topic: "Valorant".into(), direction: String::new(), format: PackFormat::Standard, style: TextStyle::default_for(ThumbShape::Wide) }
     }
 
     #[test]
@@ -349,7 +390,7 @@ mod tests {
     #[test]
     fn the_prompt_protects_the_truth_and_asks_for_the_exact_words() {
         let wide = prompt(ThumbShape::Wide, &brief("insane clutch"), None);
-        let tall = prompt(ThumbShape::Tall, &brief("insane clutch"), None);
+        let tall = prompt(ThumbShape::Tall, &Brief { style: TextStyle::default_for(ThumbShape::Tall), ..brief("insane clutch") }, None);
         for p in [&wide, &tall] {
             assert!(p.contains("\"INSANE CLUTCH\""), "{p}");
             assert!(p.contains("Do not invent") && p.contains("misleading thumbnail breaks YouTube's rules"));
@@ -357,10 +398,38 @@ mod tests {
             assert!(p.contains("Valorant") && p.contains("background only"));
         }
         assert!(wide.contains("16:9 landscape") && wide.contains("lower third"));
-        assert!(tall.contains("9:16 portrait") && tall.contains("between 45% and 75%") && tall.contains("bottom 25%"));
+        assert!(tall.contains("9:16 portrait") && tall.contains("in the middle band") && tall.contains("bottom 25%"));
         // A short word stays on one line; a longer phrase is allowed two.
         assert!(prompt(ThumbShape::Wide, &brief("ace"), None).contains("on one line"));
         assert!(wide.contains("on two lines"));
+    }
+
+    #[test]
+    fn the_creators_choices_for_the_words_reach_the_ai() {
+        let mut b = brief("insane clutch");
+        b.style = TextStyle { x: 0.1, y: 0.1, size: 0.6, fill: [0xFF, 0xFF, 0xFF], outline: [0x0B, 0x1B, 0x3A], outline_width: 2.0, shadow: false, shade: 0.0, font: "Arial Black".into(), lines: 1 };
+        let p = prompt(ThumbShape::Wide, &b, None);
+        for needle in ["in the upper third", "on the left", "white fill (#FFFFFF)", "very thick dark navy blue outline (#0B1B3A)", "Arial Black", "on one line", "about 10% across and 10% down"] {
+            assert!(p.contains(needle), "missing '{needle}' in {p}");
+        }
+        assert!(!p.contains("drop shadow") && !p.contains("soft dark shade"), "{p}");
+        // The size shown to the AI follows the size slider.
+        let share = |size: f32| -> f32 {
+            let mut b = brief("ace");
+            b.style.size = size;
+            let p = prompt(ThumbShape::Wide, &b, None);
+            let at = p.find("about ").and_then(|i| p[i + 6..].split('%').next().map(str::to_string)).unwrap();
+            at.parse().unwrap()
+        };
+        assert!(share(0.6) < share(1.0) && share(1.0) < share(1.5));
+        // Changing the look makes a new request, so an old saved picture isn't reused for it.
+        let job = |style: TextStyle| {
+            let mut j = job("http://x", ThumbShape::Wide, "ace", "style");
+            j.brief.style = style;
+            cache_name(&j)
+        };
+        assert_ne!(job(TextStyle::default_for(ThumbShape::Wide)), job(TextStyle { x: 0.2, ..TextStyle::default_for(ThumbShape::Wide) }));
+        assert_eq!(colour_name([0xFE, 0xE0, 0x05]), "bright yellow");
     }
 
     #[test]

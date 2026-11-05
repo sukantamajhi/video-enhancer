@@ -64,6 +64,12 @@ Press **Write my upload pack** under Export (single video) or at the bottom of t
 
 Every pack makes **two thumbnails**: a 1280x720 one for a normal video, and a 1080x1920 (9:16) one for a Short. Switch between them above the picture. The tall one is cut out of the wide frame, with a slider to choose where, and its text sits in the middle band, clear of the Shorts buttons and title. **Save pack and thumbnails** writes `..._thumbnail.jpg` and `..._thumbnail_shorts.jpg`.
 
+### Choosing how the words look
+
+Under the thumbnail, **Words: place, size and colours** controls the lettering on each shape (a Short and a wide thumbnail each keep their own look). **Drag the words on the picture** to move them, or use the sliders for left / right, up / down, size, outline thickness and the shade behind the words. Pick the colour of the words and of the outline from the swatches (or any colour with the picker), choose the font (Impact, Arial Black, Arial Bold or Segoe UI Black, whichever your computer has), force one or two lines, and switch the shadow on or off. On a Short, the parts that YouTube covers with its title and buttons are tinted red. The picture redraws when you let go of a control. The size can't push the words wider than the picture, and they always keep a margin from the edges.
+
+The same choices are sent to the AI when you press **Design with AI** or **Design again** (where the words go, how big they are, their colours and outline), so the AI-designed thumbnail follows them too. Changing the look after an AI design doesn't redraw it, because that would cost money; it applies to the next design.
+
 ### Design both thumbnails with AI
 
 Under the thumbnail, **Design both with AI** sends the frame you picked, your words and the game to OpenAI's image model (`gpt-image-2.5-sunburst`, or `gpt-image-2.5-flare` for speed) and gets back a finished thumbnail for each shape: 1536x864 trimmed to 1280x720 for a normal video, and 1088x1920 trimmed to 1080x1920 for a Short. Both are designed side by side, each for its own shape, using the video's own colour. You can add a wish such as "make the explosion bigger".
