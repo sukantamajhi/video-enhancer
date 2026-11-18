@@ -26,6 +26,20 @@ The **Video / Montage** switch and the **Settings** button (API keys, saved AI a
 
 Colours, type and shapes live in `app/src/theme.rs`. Text uses the system fonts (Segoe UI, Cascadia Mono). Put `Manrope-Medium.ttf`, `Manrope-ExtraBold.ttf` and `JetBrainsMono-Medium.ttf` in `app/assets/fonts` (next to where you run the app) and they are used instead.
 
+## Project layout (the gpui port is staged)
+
+The program is a Cargo workspace with three parts:
+
+- `core/` (`ve-core`): everything that isn't about how it looks: grading, FFmpeg, the graphics card, the AI helpers, music, thumbnails, saved settings. Both front ends use it.
+- `app/` (`video-enhancer`): the egui front end. This is the complete one today.
+- `gpui-app/` (`video-enhancer-gpui`): the gpui front end, being ported screen by screen. Done: window shell, theme, Start, Source, **Look** (live before/after with a draggable divider, the eight looks, every slider, playback, the trim timeline, AI assist) **Export** (wide and phone previews, framing, extras, encoder, folder, a real export with progress) and **Publish** (titles, description, tags, the search check, both thumbnails with draggable words and their colours, and the AI design with its cost). The **montage** is ported too: Clips (add, reorder, remove, style, length, sound, look, NCS music), Plan (the AI's moments, a playable preview in 16:9 or 9:16, untick moments), Make (shapes, framing, encoder, folder, a real render with progress) and Publish for a montage (its own upload pack, kept apart from a single video's). The **Settings** window (gear in the top bar: OpenAI and Gemini keys, saved AI answers, video tools download) is ported as well. The window has its own title bar too (the app's top bar doubles as it, with the system's minimise, maximise and close buttons).
+
+The editing session itself (open, frame, grade, play, AI, export, saving) is `core/src/engine.rs`, the montage's (clips, plan, music, preview, render) is `core/src/montage_engine.rs`, and the upload pack's (words, thumbnails, AI design, saving) is `core/src/publish.rs`. **Both front ends run on them**: the egui app (`app/`) only draws the screens and turns the engine's frames into textures, so a fix to the logic reaches both.
+
+**Disk space:** a debug build of the gpui app is large (about 9 GB). If your project drive is short of space, build somewhere roomier with `CARGO_TARGET_DIR`.
+
+Run either one: `cargo run -p video-enhancer` or `cargo run -p video-enhancer-gpui`. They read the same saved settings. The first gpui build takes several minutes.
+
 ## What it does
 
 - **Before/after preview**: slide, side by side, or either alone. Drop a file on the window or press Open video.

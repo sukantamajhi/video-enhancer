@@ -24,7 +24,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use eframe::wgpu;
+use wgpu;
 
 use crate::grade::{Grade, Lut};
 use crate::media::{self, Encoder, ExportJob, Tools};

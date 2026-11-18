@@ -1,431 +1,79 @@
-//! The "Upload pack" panel, shared by the single-video and montage screens:
-//! writes the titles, description and hashtags, picks a thumbnail frame and
-//! draws it, and saves everything next to the finished video.
-
-use std::path::PathBuf;
+//! The "Upload pack" panel, shared by the single-video and montage screens: the titles, description and hashtags,
+//! the thumbnail with its look, and the search check. Only the drawing is here. Writing the pack, drawing and designing
+//! the thumbnails and saving all happen in `ve_core::publish`, which both front ends share.
 
 use eframe::egui::{self, Frame, Margin, RichText, Sense, Stroke, vec2};
+use ve_core::publish::Target;
 
-use crate::grade::Grade;
-use crate::media::{self, Finish, GrabOptions};
-use crate::montage::{self, Cut, Style};
-use crate::pack::{self, Candidate, Level, Pack, PackFormat, Segment, TextStyle, ThumbShape};
+use crate::pack::{self, Level, PackFormat, TextStyle, ThumbShape};
 use crate::theme::{self, Icon, Kind};
 use crate::thumb_ai;
-use crate::{App, Msg, Step, ai, store};
+use crate::{App, Step};
+#[allow(unused_imports)]
+use crate::store;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Target {
-    Single,
-    Montage,
-}
-
-pub enum Event {
-    /// The pack, its wide and tall thumbnail pictures, and whether a saved answer was reused.
-    Made(Target, Result<(Pack, Vec<u8>, Vec<u8>, bool), String>),
-    Thumb(Target, ThumbShape, Result<Vec<u8>, String>),
-    /// One AI-designed thumbnail is done, or failed.
-    AiThumb(Target, ThumbShape, Result<thumb_ai::Made, String>),
-    /// What the AI job is doing now, for the progress card.
-    AiNote(Target, String),
-}
-
-/// What the montage screen can say about the finished video, for chapters and thumbnails.
-pub struct MontageFacts {
-    pub clips: Vec<crate::montage::Clip>,
-    pub cuts: Vec<Cut>,
-    pub grades: Vec<Grade>,
-    pub style: Style,
-    pub title: String,
-    pub credit: String,
-    pub out_dir: Option<PathBuf>,
-    /// False while the chapter times are estimates from the plan rather than the rendered video.
-    pub rendered: bool,
-}
-
+/// What the Publish screen remembers about itself: the pictures it has loaded and which one is showing.
 #[derive(Default)]
-pub struct PackState {
-    pub pack: Option<Pack>,
-    pub busy: Option<String>,
-    pub thumb: Option<Vec<u8>>,
-    pub tex: Option<egui::TextureHandle>,
-    pub thumb_busy: bool,
-    pub thumb_error: Option<String>,
-    pub auto_tried: bool,
-    /// The 9:16 thumbnail for a Short, with its own picture and texture.
-    pub thumb_tall: Option<Vec<u8>>,
-    pub tex_tall: Option<egui::TextureHandle>,
-    pub tall_busy: bool,
+pub struct PackUi {
+    tex: Option<egui::TextureHandle>,
+    tex_tall: Option<egui::TextureHandle>,
+    seen_thumb: u64,
+    seen_pack: u64,
+    seen_target: Option<Target>,
     /// Which of the two the preview shows.
-    pub view_tall: bool,
+    view_tall: bool,
     /// The crop slider moved and the picture hasn't been redrawn yet.
-    pub tall_dirty: bool,
+    tall_dirty: bool,
     /// A look control moved and the plain thumbnail hasn't been redrawn yet.
-    pub style_dirty: bool,
-    /// While the AI is designing the thumbnails: what it is doing.
-    pub ai_busy: Option<String>,
-    pub ai_pending: u8,
-    /// What the AI thumbnails cost this time, in dollars, from OpenAI's own usage report.
-    pub ai_cost: f64,
-    pub ai_reused: bool,
-    pub ai_warnings: Vec<String>,
-}
-
-impl PackState {
-    pub fn with(pack: Option<Pack>) -> Self {
-        Self { pack, ..Self::default() }
-    }
-
-    pub fn working(&self) -> bool {
-        self.busy.is_some() || self.thumb_busy || self.tall_busy || self.ai_busy.is_some()
-    }
-
-    /// What to show on the progress card, if anything is running.
-    pub fn status(&self) -> Option<String> {
-        self.busy.clone().or_else(|| self.ai_busy.clone())
-    }
-}
-
-/// Everything a pack request needs, whichever screen it came from.
-struct Request {
-    kind: String,
-    duration: f64,
-    segments: Vec<Segment>,
-    candidates: Vec<Candidate>,
-    credit: String,
+    style_dirty: bool,
 }
 
 enum Action {
     Write,
     Redraw,
     RedrawTall,
-    /// Draw just these again (a pack that came back from last time, missing some pictures).
+    /// Draw just these again.
     Restore(Vec<ThumbShape>),
     Save,
 }
 
 impl App {
-    fn pack_state(&mut self, target: Target) -> &mut PackState {
-        match target {
-            Target::Single => &mut self.pack1,
-            Target::Montage => self.mon.pack_state(),
-        }
-    }
-
-    pub fn pack_event(&mut self, event: Event) {
-        match event {
-            Event::Made(target, Ok((pack, jpeg, tall, reused))) => {
-                let st = self.pack_state(target);
-                st.view_tall = pack.format == PackFormat::Short;
-                (st.busy, st.pack, st.thumb, st.tex, st.thumb_error, st.auto_tried) = (None, Some(pack), Some(jpeg), None, None, true);
-                (st.thumb_tall, st.tex_tall, st.tall_busy) = (Some(tall), None, false);
-                (st.ai_busy, st.ai_pending, st.ai_cost, st.ai_reused) = (None, 0, 0.0, false);
-                st.ai_warnings.clear();
-                self.note(if reused { "Upload pack ready. Reused your saved AI answer, so no tokens were used." } else { "Upload pack ready. Edit anything, then save it." });
-            }
-            Event::Made(target, Err(e)) => {
-                self.pack_state(target).busy = None;
-                self.fail(e);
-            }
-            Event::AiNote(target, text) => {
-                let st = self.pack_state(target);
-                if st.ai_pending > 0 {
-                    st.ai_busy = Some(text);
-                }
-            }
-            Event::AiThumb(target, shape, result) => {
-                let st = self.pack_state(target);
-                st.ai_pending = st.ai_pending.saturating_sub(1);
-                let mut failure = None;
-                match result {
-                    Ok(made) => {
-                        match shape {
-                            ThumbShape::Wide => (st.thumb, st.tex) = (Some(made.jpeg), None),
-                            ThumbShape::Tall => (st.thumb_tall, st.tex_tall) = (Some(made.jpeg), None),
-                        }
-                        if let Some(p) = &mut st.pack {
-                            match shape {
-                                ThumbShape::Wide => p.ai_wide = Some(made.name),
-                                ThumbShape::Tall => p.ai_tall = Some(made.name),
-                            }
-                        }
-                        st.ai_cost += made.cost.unwrap_or(0.0);
-                        st.ai_reused |= made.reused;
-                        st.ai_warnings.extend(made.warning);
-                    }
-                    Err(e) => failure = Some(e),
-                }
-                let done = st.ai_pending == 0;
-                if done {
-                    st.ai_busy = None;
-                }
-                let (cost, reused, warned) = (st.ai_cost, st.ai_reused, !st.ai_warnings.is_empty());
-                if let Some(e) = failure {
-                    self.pack_state(target).thumb_error = Some(e.clone());
-                    self.fail(e);
-                } else if done {
-                    let spent = if cost > 0.0 { format!(" It cost about ${cost:.2}, worked out from OpenAI's own usage report.") } else if reused { " Reused your saved pictures, so nothing was charged.".to_string() } else { String::new() };
-                    let check = if warned { " Check the warning under the picture." } else { "" };
-                    self.note(format!("The AI designed both thumbnails.{spent}{check}"));
-                }
-            }
-            Event::Thumb(target, shape, result) => {
-                let st = self.pack_state(target);
-                match (shape, result) {
-                    (ThumbShape::Wide, Ok(bytes)) => (st.thumb_busy, st.thumb, st.tex, st.thumb_error) = (false, Some(bytes), None, None),
-                    (ThumbShape::Tall, Ok(bytes)) => (st.tall_busy, st.thumb_tall, st.tex_tall, st.thumb_error) = (false, Some(bytes), None, None),
-                    (ThumbShape::Wide, Err(e)) => (st.thumb_busy, st.thumb_error) = (false, Some(e)),
-                    (ThumbShape::Tall, Err(e)) => (st.tall_busy, st.thumb_error) = (false, Some(e)),
-                }
-            }
-        }
-    }
-
-    /// What goes into a pack for a single video: eight moments spread across the exported part.
-    fn single_request(&self) -> Option<Request> {
-        let source = self.source.as_ref()?;
-        let (a, b) = self.trim;
-        let times = media::spread_times(a, b, 8);
-        Some(Request {
-            kind: "a single gameplay recording".into(),
-            duration: b - a,
-            segments: times.iter().map(|t| Segment { at: t - a, note: String::new() }).collect(),
-            candidates: times.iter().map(|&t| Candidate { clip: source.path.clone(), t, label: format!("at {}", pack::stamp(t - a)), grade: self.grade, learned: self.learned.clone() }).collect(),
-            credit: String::new(),
-        })
-    }
-
-    /// For a montage: every kept moment is a chapter candidate, and the eight best are thumbnail candidates.
-    fn montage_request(&self) -> Option<Request> {
-        let facts = self.mon.pack_facts()?;
-        let starts = montage::segment_starts(&facts.cuts, facts.style);
-        let segments: Vec<Segment> = facts.cuts.iter().zip(&starts).map(|(c, at)| Segment { at: *at, note: c.why.clone() }).collect();
-        let mut best: Vec<usize> = (0..facts.cuts.len()).collect();
-        best.sort_by(|&x, &y| facts.cuts[y].score.total_cmp(&facts.cuts[x].score));
-        best.truncate(8);
-        best.sort_unstable();
-        let candidates = best
-            .into_iter()
-            .map(|i| {
-                let cut = &facts.cuts[i];
-                Candidate { clip: facts.clips[cut.clip].path.clone(), t: cut.start + cut.len() / 2.0, label: format!("moment {i}: {}", cut.why), grade: facts.grades.get(cut.clip).copied().unwrap_or_default(), learned: None }
-            })
-            .collect();
-        let duration = starts.last().zip(facts.cuts.last()).map_or(0.0, |(s, c)| s + c.len());
-        let kind = match facts.style {
-            Style::Highlights => "a highlight reel made from several clips",
-            Style::BeatSync => "a fast beat-synced montage made from several clips",
-            Style::Story => "a story-style edit of several clips",
-        };
-        Some(Request { kind: kind.into(), duration, segments, candidates, credit: facts.credit })
-    }
-
-    fn start_pack(&mut self, target: Target) {
-        let Some(tools) = self.tools.clone() else { return };
-        let Some(key) = ai::load_key(ai::Provider::OpenAi) else {
-            self.fail("Add your OpenAI key first (in the AI helpers section).");
-            return;
-        };
-        let request = match target {
-            Target::Single => self.single_request(),
-            Target::Montage => self.montage_request(),
-        };
-        let Some(request) = request else {
-            self.fail(if target == Target::Single { "Open a video first." } else { "Plan the montage first." });
-            return;
-        };
-        let (model, notes, reuse, mail) = (ai::OPENAI_MODELS[self.openai_model].0, self.style_notes.clone(), self.reuse_ai, self.mail.clone());
-        let (topic, format) = (self.pack_topic.trim().to_string(), self.pack_format);
-        self.pack_state(target).busy = Some("Writing your upload pack…".into());
-        std::thread::spawn(move || {
-            let work = std::env::temp_dir().join(format!("video-enhancer-pack-{}-{target:?}", std::process::id()));
-            let result = (|| -> Result<(Pack, Vec<u8>, Vec<u8>, bool), String> {
-                let options = GrabOptions { width: 512, finish: Finish { sharpen: 0.0, denoise: 0.0, loudness: false }, crop_wide: false };
-                let mut frames = Vec::new();
-                for c in &request.candidates {
-                    let probe = media::probe(&tools, &c.clip)?;
-                    frames.push((c.label.clone(), media::grab_frame(&tools, &probe, &c.clip, c.t, &options)?));
-                }
-                // The same footage, moments and wording always make the same question, so its answer can be reused.
-                let mut facts = vec!["pack".to_string(), ai::PACK_PROMPT_VERSION.to_string(), model.to_string(), request.kind.clone(), format!("{:.1}", request.duration), notes.trim().to_string(), topic.clone(), format.name().to_string()];
-                facts.extend(request.segments.iter().map(|s| format!("{:.1}|{}", s.at, s.note)));
-                facts.extend(request.candidates.iter().map(|c| format!("{}|{:.2}|{}", store::fingerprint(&c.clip), c.t, c.label)));
-                let cache = format!("ai-pack-{}", store::hash(&facts));
-                let (answer, reused) = match reuse.then(|| store::load::<ai::AiPack>(&cache)).flatten() {
-                    Some(saved) => (saved, true),
-                    None => {
-                        let fresh = ai::openai_pack(&key, model, &ai::PackRequest { kind: &request.kind, duration: request.duration, notes: &notes, topic: &topic, format, segments: &request.segments, frames: &frames })?;
-                        store::save(&cache, &fresh);
-                        (fresh, false)
-                    }
-                };
-                let pack = Pack::assemble(&answer, &request.segments, request.candidates.clone(), request.credit.clone(), format)?;
-                let picked = &pack.candidates[pack.thumb_pick];
-                let jpeg = pack::render_thumbnail(&tools, picked, &pack.thumb_text, &work, ThumbShape::Wide, 0.5)?;
-                let tall = pack::render_thumbnail(&tools, picked, &pack.thumb_text, &work, ThumbShape::Tall, 0.5)?;
-                Ok((pack, jpeg, tall, reused))
-            })();
-            std::fs::remove_dir_all(&work).ok();
-            mail.send(Msg::Pack(Event::Made(target, result)));
-        });
-    }
-
-    /// Draws the plain (free) thumbnails again, for the shapes given. An AI picture for a shape is replaced.
-    fn redraw_thumbnail(&mut self, target: Target, shapes: Vec<ThumbShape>) {
-        let Some(tools) = self.tools.clone() else { return };
-        let st = self.pack_state(target);
-        let Some(pack) = &st.pack else { return };
-        let (candidate, text, x) = (pack.candidates.get(pack.thumb_pick).cloned(), pack.thumb_text.clone(), pack.thumb_x.unwrap_or(0.5));
-        let styles = (pack.style(ThumbShape::Wide), pack.style(ThumbShape::Tall));
-        let Some(candidate) = candidate else { return };
-        if let Some(p) = &mut st.pack {
-            for shape in &shapes {
-                match shape {
-                    ThumbShape::Wide => p.ai_wide = None,
-                    ThumbShape::Tall => p.ai_tall = None,
-                }
-            }
-        }
-        for shape in &shapes {
-            match shape {
-                ThumbShape::Wide => st.thumb_busy = true,
-                ThumbShape::Tall => st.tall_busy = true,
-            }
-        }
-        let mail = self.mail.clone();
-        std::thread::spawn(move || {
-            let work = std::env::temp_dir().join(format!("video-enhancer-thumb-{}-{target:?}", std::process::id()));
-            for shape in shapes {
-                let style = if shape == ThumbShape::Wide { &styles.0 } else { &styles.1 };
-                let result = pack::render_styled(&tools, &candidate, &text, &work, shape, x, style);
-                mail.send(Msg::Pack(Event::Thumb(target, shape, result)));
-            }
-            std::fs::remove_dir_all(&work).ok();
-        });
-    }
-
-    /// Sends the chosen frame and the words to OpenAI to design both thumbnails, one request per shape, side by side.
-    pub fn start_ai_thumbnails(&mut self, target: Target) {
-        let Some(tools) = self.tools.clone() else { return };
-        let Some(key) = ai::load_key(ai::Provider::OpenAi) else {
-            self.fail("Add your OpenAI key first (Settings, top right).");
-            return;
-        };
-        let (model, quality) = (thumb_ai::IMAGE_MODELS[self.thumb_model.min(thumb_ai::IMAGE_MODELS.len() - 1)].0, thumb_ai::QUALITIES[self.thumb_quality.min(thumb_ai::QUALITIES.len() - 1)].0);
-        let (text_model, topic, reuse, mail) = (ai::OPENAI_MODELS[self.openai_model].0, self.pack_topic.trim().to_string(), self.reuse_ai, self.mail.clone());
-        let st = self.pack_state(target);
-        if st.ai_busy.is_some() {
-            return;
-        }
-        let Some(pack) = &st.pack else { return };
-        let Some(candidate) = pack.candidates.get(pack.thumb_pick).cloned() else { return };
-        let brief = thumb_ai::Brief { text: pack::clean_thumb_text(&pack.thumb_text), topic, direction: pack.thumb_note.clone(), format: pack.format, style: TextStyle::default_for(ThumbShape::Wide) };
-        let styles = (pack.style(ThumbShape::Wide), pack.style(ThumbShape::Tall));
-        let x = pack.thumb_x.unwrap_or(0.5);
-        (st.ai_busy, st.ai_pending, st.ai_cost, st.ai_reused, st.thumb_error) = (Some("Getting the frames ready…".into()), 2, 0.0, false, None);
-        st.ai_warnings.clear();
-        for shape in [ThumbShape::Wide, ThumbShape::Tall] {
-            let (tools, key, candidate, mut brief, mail) = (tools.clone(), key.clone(), candidate.clone(), brief.clone(), mail.clone());
-            brief.style = if shape == ThumbShape::Wide { styles.0.clone() } else { styles.1.clone() };
-            let (model, quality, text_model) = (model.to_string(), quality.to_string(), text_model.to_string());
-            std::thread::spawn(move || {
-                let work = std::env::temp_dir().join(format!("video-enhancer-ai-thumb-{}-{target:?}-{shape:?}", std::process::id()));
-                let result = (|| {
-                    let frame = pack::base_frame(&tools, &candidate, shape, x, &work)?;
-                    let job = thumb_ai::Job { base: thumb_ai::api_base(), key, model, quality, text_model, shape, brief, frame, reuse, cache_dir: store::dir() };
-                    thumb_ai::run(&job, &|text| mail.send(Msg::Pack(Event::AiNote(target, text.to_string()))))
-                })();
-                std::fs::remove_dir_all(&work).ok();
-                mail.send(Msg::Pack(Event::AiThumb(target, shape, result)));
-            });
-        }
-    }
-
-    fn save_pack(&mut self, target: Target) {
-        let (dir, stem) = match target {
-            Target::Single => {
-                let Some(source) = &self.source else { return };
-                let stem = source.path.file_stem().map_or_else(|| "video".to_string(), |s| s.to_string_lossy().into_owned());
-                (self.out_dir.clone().or_else(|| source.path.parent().map(PathBuf::from)), stem)
-            }
-            Target::Montage => {
-                let Some(facts) = self.mon.pack_facts() else { return };
-                (facts.out_dir.or_else(|| facts.clips.first().and_then(|c| c.path.parent().map(PathBuf::from))), crate::montage_ui::safe_name(&facts.title))
-            }
-        };
-        let dir = dir.unwrap_or_else(std::env::temp_dir);
-        let st = self.pack_state(target);
-        let (Some(pack), thumb, tall) = (&st.pack, st.thumb.clone(), st.thumb_tall.clone()) else { return };
-        let text_file = media::free_name(&dir, &stem, "_upload_pack", "txt");
-        let mut saved = vec![text_file.clone()];
-        let mut problem = std::fs::write(&text_file, pack.as_text()).err().map(|e| e.to_string());
-        if let (None, Some(bytes)) = (&problem, thumb) {
-            let thumb_file = media::free_name(&dir, &stem, "_thumbnail", "jpg");
-            problem = std::fs::write(&thumb_file, bytes).err().map(|e| e.to_string());
-            saved.push(thumb_file);
-        }
-        if let (None, Some(bytes)) = (&problem, tall) {
-            let tall_file = media::free_name(&dir, &stem, "_thumbnail_shorts", "jpg");
-            problem = std::fs::write(&tall_file, bytes).err().map(|e| e.to_string());
-            saved.push(tall_file);
-        }
-        match problem {
-            None => self.note(format!("Saved {} to {}", saved.iter().filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned())).collect::<Vec<_>>().join(" and "), dir.display())),
-            Some(e) => self.fail(format!("Couldn't save the pack: {e}")),
-        }
-    }
-
     /// The Publish step: the words on the left, the search check and thumbnail on the right.
-    pub fn publish_screen(&mut self, ui: &mut egui::Ui, target: Target) {
+    pub fn publish_screen(&mut self, ui: &mut egui::Ui) {
+        let target = self.engine.target;
+        let facts = self.engine.montage_facts();
         let ready = match target {
-            Target::Single => self.source.is_some(),
-            Target::Montage => self.mon.pack_facts().is_some(),
+            Target::Single => self.engine.source.is_some(),
+            Target::Montage => facts.is_some(),
         };
-        let estimate = target == Target::Montage && self.mon.pack_facts().is_some_and(|f| !f.rendered);
-        let has_key = self.has_openai;
+        let estimate = target == Target::Montage && facts.is_some_and(|f| !f.rendered);
+        let has_key = self.engine.has_openai;
         let ctx = ui.ctx().clone();
         let mut action: Option<Action> = None;
         let mut copy: Option<String> = None;
         let mut open_settings = false;
         let mut go_back = false;
 
+        // The pictures: decode them into textures when the engine has new ones, and open on the tall one for a Short.
         let (busy, have) = {
-            let st = self.pack_state(target);
-            // Decode the thumbnail picture into a texture the first time it is needed.
-            if st.tex.is_none()
-                && let Some(bytes) = &st.thumb
-                && let Ok(picture) = image::load_from_memory(bytes)
-            {
-                let rgba = picture.to_rgba8();
-                st.tex = Some(ctx.load_texture(format!("pack-thumb-{target:?}"), egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba), egui::TextureOptions::LINEAR));
+            let st = &self.engine.publish;
+            let ui_state = &mut self.pack_ui;
+            if ui_state.seen_target != Some(target) {
+                ui_state.seen_target = Some(target);
+                (ui_state.seen_pack, ui_state.seen_thumb) = (u64::MAX, u64::MAX);
             }
-            if st.tex_tall.is_none()
-                && let Some(bytes) = &st.thumb_tall
-                && let Ok(picture) = image::load_from_memory(bytes)
-            {
-                let rgba = picture.to_rgba8();
-                st.tex_tall = Some(ctx.load_texture(format!("pack-thumb-tall-{target:?}"), egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba), egui::TextureOptions::LINEAR));
+            if st.pack_gen != ui_state.seen_pack {
+                ui_state.seen_pack = st.pack_gen;
+                ui_state.view_tall = st.pack.as_ref().is_some_and(|p| p.format == PackFormat::Short);
             }
-            // A pack restored from last time has its words but not its pictures yet.
-            if st.pack.is_some() && (st.thumb.is_none() || st.thumb_tall.is_none()) && !st.thumb_busy && !st.tall_busy && !st.auto_tried {
-                st.auto_tried = true;
-                // A pack for a Short opens on the tall thumbnail.
-                st.view_tall = st.pack.as_ref().is_some_and(|p| p.format == PackFormat::Short);
-                // Pictures the AI designed earlier come back from disk, free. The others are drawn plainly.
-                let mut missing = Vec::new();
-                if let Some(p) = &mut st.pack {
-                    match p.ai_wide.as_deref().and_then(store::load_bytes) {
-                        Some(bytes) => (st.thumb, st.tex) = (Some(bytes), None),
-                        None => (p.ai_wide, missing) = (None, [missing, vec![ThumbShape::Wide]].concat()),
-                    }
-                    match p.ai_tall.as_deref().and_then(store::load_bytes) {
-                        Some(bytes) => (st.thumb_tall, st.tex_tall) = (Some(bytes), None),
-                        None => (p.ai_tall, missing) = (None, [missing, vec![ThumbShape::Tall]].concat()),
-                    }
-                }
-                if !missing.is_empty() {
-                    action = Some(Action::Restore(missing));
-                }
+            if st.thumb_gen != ui_state.seen_thumb {
+                ui_state.seen_thumb = st.thumb_gen;
+                let load = |bytes: &Option<Vec<u8>>, name: String| {
+                    let picture = image::load_from_memory(bytes.as_deref()?).ok()?.to_rgba8();
+                    Some(ctx.load_texture(name, egui::ColorImage::from_rgba_unmultiplied([picture.width() as usize, picture.height() as usize], &picture), egui::TextureOptions::LINEAR))
+                };
+                ui_state.tex = load(&st.thumb, format!("pack-thumb-{target:?}"));
+                ui_state.tex_tall = load(&st.thumb_tall, format!("pack-thumb-tall-{target:?}"));
             }
             (st.busy.clone(), st.pack.is_some())
         };
@@ -440,12 +88,11 @@ impl App {
                 });
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.add_space(16.0);
-                    let (mut model_i, mut quality_i) = (self.thumb_model, self.thumb_quality);
-                    let st = self.pack_state(target);
+                    let (mut model_i, mut quality_i) = (self.engine.settings.thumb_model, self.engine.settings.thumb_quality);
+                    let (tex, tex_tall, mut view_tall, mut dirty) = (self.pack_ui.tex.clone(), self.pack_ui.tex_tall.clone(), self.pack_ui.view_tall, self.pack_ui.tall_dirty);
+                    let st = &mut self.engine.publish;
                     let (ai_busy, ai_cost, ai_reused, ai_warnings) = (st.ai_busy.clone(), st.ai_cost, st.ai_reused, st.ai_warnings.clone());
-                    let (thumb_busy, tex, thumb_error) = (st.thumb_busy || st.tall_busy || st.ai_busy.is_some(), st.tex.clone(), st.thumb_error.clone());
-                    let (tex_tall, mut view_tall) = (st.tex_tall.clone(), st.view_tall);
-                    let mut dirty = st.tall_dirty;
+                    let (thumb_busy, thumb_error) = (st.thumb_busy || st.tall_busy || st.ai_busy.is_some(), st.thumb_error.clone());
                     let released = !ui.input(|i| i.pointer.any_down());
                     let mut changed_x = false;
                     let mut ask_ai = false;
@@ -680,23 +327,23 @@ impl App {
                         }
                     });
                     ui.add_space(16.0);
-                    let st = self.pack_state(target);
-                    st.view_tall = view_tall;
-                    (self.thumb_model, self.thumb_quality) = (model_i, quality_i);
+                    self.pack_ui.view_tall = view_tall;
+                    (self.engine.settings.thumb_model, self.engine.settings.thumb_quality) = (model_i, quality_i);
                     if ask_ai {
-                        self.confirm_ai_thumb = Some(target);
+                        self.confirm_ai_thumb = true;
                     }
-                    let st = self.pack_state(target);
+                    let (thumb_busy_now, tall_busy_now) = (self.engine.publish.thumb_busy, self.engine.publish.tall_busy);
+                    let st = &mut self.pack_ui;
                     dirty |= changed_x;
                     // Redraw once the slider is let go, not on every pixel of the drag.
-                    if dirty && released && !st.tall_busy {
+                    if dirty && released && !tall_busy_now {
                         dirty = false;
                         action = Some(Action::RedrawTall);
                     }
                     st.tall_dirty = dirty;
                     // The look of the words: redraw the plain picture once the control is let go. An AI design is left alone.
                     let mut style_dirty = st.style_dirty || (style_changed && !style_designed);
-                    if style_dirty && released && !st.thumb_busy && !st.tall_busy && action.is_none() {
+                    if style_dirty && released && !thumb_busy_now && !tall_busy_now && action.is_none() {
                         style_dirty = false;
                         action = Some(Action::Restore(vec![view_shape]));
                     }
@@ -721,10 +368,10 @@ impl App {
                         ui.label(theme::bold("Tell the AI what this is", 14.0));
                         ui.horizontal(|ui| {
                             ui.label(theme::soft("Game or topic"));
-                            ui.add(egui::TextEdit::singleline(&mut self.pack_topic).hint_text("for example Valorant").desired_width(220.0).margin(Margin::symmetric(10, 8)))
+                            ui.add(egui::TextEdit::singleline(&mut self.engine.settings.pack_topic).hint_text("for example Valorant").desired_width(220.0).margin(Margin::symmetric(10, 8)))
                                 .on_hover_text("The game's exact name is the strongest search keyword for a gaming video, and it is used exactly as you type it. Leave it empty and the AI names a game only if it can clearly see which one.");
                         });
-                        theme::segmented(ui, &mut self.pack_format, &[(PackFormat::Standard, "Standard video"), (PackFormat::Short, "YouTube Short")], false);
+                        theme::segmented(ui, &mut self.engine.settings.pack_format, &[(PackFormat::Standard, "Standard video"), (PackFormat::Short, "YouTube Short")], false);
                         ui.horizontal(|ui| {
                             ui.add_enabled_ui(ready && has_key && busy.is_none(), |ui| {
                                 if theme::button(ui, if have { "Write it again" } else { "Write my upload pack" }, Kind::Primary, 0.0).on_hover_text("Three titles, a description with chapters, hashtags and a thumbnail. Sends about 8 small pictures to OpenAI.").clicked() {
@@ -757,8 +404,7 @@ impl App {
                         }
                     });
 
-                    let st = self.pack_state(target);
-                    let Some(pack) = &mut st.pack else { return };
+                    let Some(pack) = &mut self.engine.publish.pack else { return };
                     let good_len = if pack.format == PackFormat::Short { 40 } else { 60 };
                     ui.add_space(4.0);
                     theme::card(ui, |ui| {
@@ -854,19 +500,19 @@ impl App {
         }
         if let Some(text) = copy {
             ctx.copy_text(text);
-            self.note("Copied.");
+            self.engine.note_copied();
         }
         match action {
-            Some(Action::Write) => self.start_pack(target),
+            Some(Action::Write) => self.engine.start_pack(),
             Some(Action::Redraw) => {
-                if let Some(pack) = &mut self.pack_state(target).pack {
+                if let Some(pack) = &mut self.engine.publish.pack {
                     pack.thumb_text = pack::clean_thumb_text(&pack.thumb_text);
                 }
-                self.redraw_thumbnail(target, vec![ThumbShape::Wide, ThumbShape::Tall]);
+                self.engine.redraw_thumbnails(vec![ThumbShape::Wide, ThumbShape::Tall]);
             }
-            Some(Action::RedrawTall) => self.redraw_thumbnail(target, vec![ThumbShape::Tall]),
-            Some(Action::Restore(shapes)) => self.redraw_thumbnail(target, shapes),
-            Some(Action::Save) => self.save_pack(target),
+            Some(Action::RedrawTall) => self.engine.redraw_thumbnails(vec![ThumbShape::Tall]),
+            Some(Action::Restore(shapes)) => self.engine.redraw_thumbnails(shapes),
+            Some(Action::Save) => self.engine.save_pack(),
             None => {}
         }
     }

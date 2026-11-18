@@ -1,0 +1,11 @@
+[package]
+name = "video-enhancer-gpui"
+version = "0.1.0"
+edition = "2024"
+description = "The video enhancer's gpui front end, built on the same ve-core as the egui one."
+
+[dependencies]
+ve-core = { path = "../core" }
+# GPUI and its component library, pinned together. Do not add `gpui` on its own: the components need the matching build.
+gpui-kit = "0.10.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
