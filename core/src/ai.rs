@@ -115,6 +115,14 @@ pub fn omni_prompt(style: &str) -> String {
     )
 }
 
+/// True for an https link on a Google API host, the only place the Gemini key may be sent.
+fn google_host(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or("").split(':').next().unwrap_or("");
+    host == "googleapis.com" || host.ends_with(".googleapis.com")
+}
+
 /// Pulls the video out of the reply: inline data, or a link to download.
 fn omni_video(reply: &Value, key: &str) -> Result<Vec<u8>, String> {
     let steps = reply["steps"].as_array().ok_or("Gemini Omni's reply had no result in it.")?;
@@ -124,8 +132,12 @@ fn omni_video(reply: &Value, key: &str) -> Result<Vec<u8>, String> {
                 return STANDARD.decode(data).map_err(|e| format!("The returned video was damaged: {e}"));
             }
             if let Some(uri) = part["uri"].as_str() {
-                let url = if uri.contains('?') { format!("{uri}&key={key}") } else { format!("{uri}?key={key}") };
-                let mut response = agent(300).get(&url).call().map_err(|e| format!("Couldn't download the graded clip: {e}"))?;
+                // The key goes in a header, never in the URL, and only to Google's own hosts.
+                let mut request = agent(300).get(uri);
+                if google_host(uri) {
+                    request = request.header("x-goog-api-key", key);
+                }
+                let mut response = request.call().map_err(|e| format!("Couldn't download the graded clip: {e}"))?;
                 if !response.status().is_success() {
                     return Err(format!("Couldn't download the graded clip ({}).", response.status().as_u16()));
                 }
@@ -699,6 +711,17 @@ mod tests {
             "status": "completed",
         });
         assert_eq!(omni_video(&reply, "k").unwrap(), b"movie");
+    }
+
+    #[test]
+    fn the_key_is_only_sent_to_google_hosts() {
+        assert!(google_host("https://generativelanguage.googleapis.com/v1beta/files/abc:download?alt=media"));
+        assert!(google_host("https://googleapis.com/x"));
+        assert!(!google_host("http://generativelanguage.googleapis.com/x"));
+        assert!(!google_host("https://evil.example.com/generativelanguage.googleapis.com"));
+        assert!(!google_host("https://googleapis.com.evil.example/x"));
+        assert!(!google_host("https://generativelanguage.googleapis.com@evil.example/x"));
+        assert!(!google_host("https://notgoogleapis.com/x"));
     }
 
     #[test]
