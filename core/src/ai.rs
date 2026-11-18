@@ -465,14 +465,14 @@ pub struct PackRequest<'a> {
 pub fn pack_instructions(format: PackFormat) -> String {
     let (title_rule, description_rule, chapter_rule, hashtag_rule) = match format {
         PackFormat::Standard => (
-            "Keep each title to 60 characters or fewer when you can: longer titles tend to be cut off in search results and on phones. Never go above 90.",
+            "Keep the words of each title to 60 characters or fewer when you can (the hashtags at the end do not count): longer titles tend to be cut off in search results and on phones. Never go above 100 in total.",
             "The first sentence must be under 150 characters, because viewers see only the first lines before \"Show more\". It must describe the video and contain the primary keyword. Then add two or three more sentences.",
             "For each moment number, write a chapter title of 2 to 5 words that says what happens there. Use the primary keyword in a chapter title only where it fits naturally.",
             "",
         ),
         PackFormat::Short => (
-            "Keep each title to 40 characters or fewer: Shorts are skimmed quickly in a feed.",
-            "Write one or two short sentences. The first must be under 100 characters and contain the primary keyword.",
+            "Keep the words of each title to 50 characters or fewer when you can (the hashtags at the end do not count): Shorts are skimmed quickly in a feed. Never go above 100 in total.",
+            "The first sentence must be under 100 characters and contain the primary keyword. Then add one or two more short sentences.",
             "Shorts have no chapters, but still return a very short title for each moment number.",
             "Include Shorts as one of the three most important hashtags.",
         ),
@@ -482,14 +482,15 @@ pub fn pack_instructions(format: PackFormat) -> String {
          How this works:\n\
          - YouTube matches what people type mainly against the title, thumbnail and description. Tags matter very little. Hashtags help a little.\n\
          - Search results and the video page show the title and the first lines of the description first.\n\
-         - Misleading titles, thumbnails, descriptions, unrelated hashtags and excessive tags break YouTube's spam policy. Honest and specific always beats clever.\n\n\
+         - Misleading titles, thumbnails, descriptions, unrelated hashtags and excessive tags break YouTube's spam policy.\n\
+         - Energy sells: the creator's best-performing videos use hype titles, emojis and a friendly call to action. Write in that voice, but make the hype describe what is really in the footage. Specific and exciting beats vague and exciting.\n\n\
          Rules:\n\
-         1. Focus keyword. Choose ONE primary keyword: 1 to 4 words a viewer would really type to find this video, usually the game name plus what happens (for example \"Valorant clutch\" or \"Minecraft speedrun\"). Also choose up to 3 secondary keywords: related searches. Use the game or topic exactly as the creator spelled it. If no game or topic was given, name a game ONLY if its title, logo or interface is clearly visible in the pictures; otherwise write about the action without naming a game. Never guess a game, character, map, score, rank, player name or any fact you cannot see or were not told.\n\
-         2. Titles. Write exactly three, each from a different angle: (a) keyword-first and descriptive, (b) the result or moment that makes people curious, (c) the stakes or a specific detail that is really in the footage. {title_rule} Put the primary keyword in the first half of every title. Use normal capitalisation (no ALL-CAPS words), at most one emoji, no quotation marks and no hashtags in the title. Never promise anything the video does not show.\n\
-         3. Description intro. {description_rule} State plainly what the video shows. Use the primary keyword once in the first sentence and, naturally, one or two secondary keywords later. Write for people, not for a robot: no keyword lists, no repeated sentences, no calls to like or subscribe, no links, no timestamps and no hashtags (the app adds the chapters, music credit and hashtags itself). Do not mention AI unless the creator told you to.\n\
+         1. Focus keyword. Choose ONE primary keyword: 1 to 4 words a viewer would really type to find this video, usually the game name plus what happens (for example \"Valorant clutch\" or \"Minecraft speedrun\"). Also choose up to 3 secondary keywords: related searches. Use the game or topic exactly as the creator spelled it. If no game or topic was given, name a game ONLY if its title, logo or interface is clearly visible in the pictures; otherwise write about the action without naming a game. Name an agent, character, map, weapon or player only if the creator gave it (topic or notes) or it is clearly readable on screen (kill feed, loadout, scoreboard, map name). Never guess a score, rank, player name or any other fact you cannot see or were not told.\n\
+         2. Titles. Write exactly three, each from a different angle: (a) keyword-first and descriptive, (b) the result or moment that makes people curious, (c) the stakes or a specific detail that is really in the footage. {title_rule} Put the primary keyword in the first half of every title. Make every title punchy: put one or two hype words in ALL CAPS (such as INSANE, CRAZY, CLUTCH, EPIC), use one or two fitting emojis (a 🔥 or 💥 at the start or end), and a separator such as a | or a + between the moment and the game. Finish each title with one or two relevant hashtags of its own (for example #valorant), written with the # sign. No quotation marks. Never promise anything the video does not show: do not call ordinary play \"pro\", and do not write ace, 1v5, 1v3, high-ELO or any other claim the pictures and notes do not back up.\n\
+         3. Description intro. {description_rule} Write it as three paragraphs separated by a blank line. (a) The hook: open with it, use the primary keyword once in the first sentence, then add one or two sentences that say plainly what the clip shows, naming the agents, map, weapons and moments you can see or were told about, and use one or two secondary keywords naturally. (b) One audience line saying who the clip is for, for example \"A must-watch for Valorant fans, duelist mains and teamplay lovers!\" (it describes the audience, not the footage). (c) The call to action ALONE in its own paragraph, starting with 🔔 and asking viewers to like, comment and subscribe for more of this game's clips. Use two to four fitting emojis in total, at the end of sentences. Make it read like a person who loves the game wrote it: vary the wording, and never repeat a word or phrase across sentences (do not say ace twice, for example). No keyword lists, no links, no timestamps and no hashtags (the app adds the chapters, music credit and hashtags itself). Never describe tactics, plays or skill the footage does not show (for example \"clutch utility usage\"). Do not mention AI unless the creator told you to.\n\
          4. Chapter titles. {chapter_rule}\n\
-         5. Hashtags. Give 3 to 5, with no spaces and no # sign, each clearly relevant. Order them by importance: YouTube shows only the first three above the title, so the game or topic comes first. {hashtag_rule}\n\
-         6. Tags. Give 8 to 12 hidden tags: spelling variants and common misspellings of the game name, and close phrases. They matter little, so never pad: fewer good tags beat many weak ones. Keep the total under 400 characters.\n\
+         5. Hashtags. Give 8 to 10, with no spaces and no # sign, each clearly relevant and each something viewers really use or search for. Order them by importance: YouTube shows only the first three above the title, so the game or topic comes first. Then cover, in this order: an agent, map or weapon you can name; the game joined to the format or the kind of moment (for example ValorantShorts, ValorantClips, ValorantGameplay, ValorantCombo, or the game plus ACE or Clutch only when the footage really shows one); the game joined to the map or agent (for example ValorantSunset); and general ones such as FPS and GamingShorts. If the creator's notes name their channel or squad, include it. Never invent a phrase of your own as a hashtag (not TriggerDiscipline, for example), and never repeat the same hashtag in a different spelling. {hashtag_rule}\n\
+         6. Tags. Give 10 to 12 hidden tags, most important first: the game name and its common spellings and misspellings, the agents or map you named, close search phrases (for example \"valorant clips\", \"valorant gameplay\"), the kind of content (gaming, gameplay, shorts, funny moments), and the creator's channel or squad name if the notes give it. Every tag must be about this video: never add other games, other creators, or words like pro or noob unless they are true of the footage. Keep the total under 400 characters.\n\
          7. Thumbnail. Choose the candidate frame with the clearest subject and the strongest action or emotion, one that stays readable when small. Write 1 to 3 words in capitals (at most 18 characters) that add to the title instead of repeating it. It must be true to the footage.\n\
          8. Write in the language of the creator's notes (English if there are none).\n\
          9. Never invent sponsors, links, social handles, prices, rankings or claims."
@@ -502,8 +503,8 @@ fn pack_schema() -> Value {
         "properties": {
             "primary_keyword": { "type": "string", "description": "The one main search phrase, 1 to 4 words" },
             "secondary_keywords": { "type": "array", "items": { "type": "string" }, "description": "Up to three related search phrases" },
-            "titles": { "type": "array", "items": { "type": "string" }, "description": "Exactly three different titles, primary keyword in the first half, honest" },
-            "intro": { "type": "string", "description": "The description intro: the first sentence names the video and the primary keyword. No timestamps, hashtags or links" },
+            "titles": { "type": "array", "items": { "type": "string" }, "description": "Exactly three different titles, primary keyword in the first half, hype words and emojis, one or two hashtags at the end, true to the footage" },
+            "intro": { "type": "string", "description": "The description intro as three paragraphs separated by a blank line: the hook and what the clip shows, one audience line, then the 🔔 like/comment/subscribe line alone. No timestamps, hashtags or links" },
             "chapter_titles": {
                 "type": "array",
                 "items": {
@@ -516,8 +517,8 @@ fn pack_schema() -> Value {
                     "additionalProperties": false,
                 },
             },
-            "hashtags": { "type": "array", "items": { "type": "string" }, "description": "Three to five hashtags without the # sign, no spaces, most important first" },
-            "tags": { "type": "array", "items": { "type": "string" }, "description": "Eight to twelve hidden tags, under 400 characters in total" },
+            "hashtags": { "type": "array", "items": { "type": "string" }, "description": "Eight to ten real, relevant hashtags without the # sign, no spaces, most important first, none invented" },
+            "tags": { "type": "array", "items": { "type": "string" }, "description": "Ten to twelve hidden tags about this video, most important first, under 400 characters in total" },
             "thumbnail": {
                 "type": "object",
                 "properties": {
@@ -610,12 +611,27 @@ mod tests {
     #[test]
     fn the_instructions_carry_the_search_rules_for_each_format() {
         let long = pack_instructions(PackFormat::Standard);
-        for needle in ["ONE primary keyword", "first half of every title", "60 characters", "150 characters", "Show more", "first three above the title", "spam policy", "Never guess a game", "under 400 characters", "no hashtags"] {
+        for needle in ["ONE primary keyword", "first half of every title", "60 characters", "150 characters", "Show more", "first three above the title", "spam policy", "Never guess a score", "under 400 characters", "no hashtags"] {
             assert!(long.contains(needle), "the standard instructions lost: {needle}");
         }
         let short = pack_instructions(PackFormat::Short);
-        assert!(short.contains("40 characters") && short.contains("Shorts as one of the three") && !short.contains("150 characters"), "{short}");
+        assert!(short.contains("50 characters") && short.contains("Shorts as one of the three") && !short.contains("150 characters"), "{short}");
         assert_ne!(long, short);
+    }
+
+    #[test]
+    fn the_instructions_ask_for_the_energetic_style_without_dropping_honesty() {
+        for format in [PackFormat::Standard, PackFormat::Short] {
+            let text = pack_instructions(format);
+            // The style that worked: hype words, emojis, hashtags in the title, a closing call to action.
+            for needle in ["ALL CAPS", "emojis", "hashtags of its own", "like, comment and subscribe", "channel or squad", "ALONE in its own paragraph", "audience line", "Never invent a phrase", "8 to 10"] {
+                assert!(text.contains(needle), "{format:?} lost the style rule: {needle}");
+            }
+            // The honesty rules that keep it inside YouTube's spam policy.
+            for needle in ["do not call ordinary play", "never add other games", "clearly readable on screen", "clutch utility usage", "Never invent sponsors"] {
+                assert!(text.contains(needle), "{format:?} lost the honesty rule: {needle}");
+            }
+        }
     }
 
     #[test]

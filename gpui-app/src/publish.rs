@@ -279,11 +279,11 @@ impl Shell {
 
     fn titles_card(&self, cx: &mut Context<Self>) -> Div {
         let Some(pack) = &self.engine.publish.pack else { return div() };
-        let good_len = if pack.format == pack::PackFormat::Short { 40 } else { 60 };
+        let good_len = if pack.format == pack::PackFormat::Short { 50 } else { 60 };
         let mut card = theme::card().flex().flex_col().gap(px(8.0)).child(div().flex().items_baseline().gap(px(10.0)).child(theme::heading("Titles", 14.0)).child(theme::muted("Pick one and edit it freely")));
         for (i, title) in pack.titles.iter().enumerate().take(3) {
             let n = title.chars().count();
-            let hex = if n == 0 || n > pack::MAX_TITLE { BAD } else if n <= good_len { OK } else { WARN };
+            let hex = if n == 0 || n > pack::MAX_TITLE { BAD } else if pack::title_length(title) <= good_len { OK } else { WARN };
             let chosen = pack.title_pick == i;
             let text = title.clone();
             card = card.child(

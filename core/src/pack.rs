@@ -161,6 +161,16 @@ pub fn clean_titles(titles: &[String]) -> Vec<String> {
     out
 }
 
+/// The length of a title's words, not counting the hashtags it ends with, so "INSANE clutch #valorant"
+/// is judged on "INSANE clutch". This is the figure the "short enough to show in full" check uses.
+pub fn title_length(title: &str) -> usize {
+    let mut words: Vec<&str> = title.split_whitespace().collect();
+    while words.last().is_some_and(|w| w.starts_with('#') && w.len() > 1) {
+        words.pop();
+    }
+    words.join(" ").chars().count()
+}
+
 pub fn clean_hashtags(tags: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in tags {
@@ -169,8 +179,21 @@ pub fn clean_hashtags(tags: &[String]) -> Vec<String> {
             out.push(tag);
         }
     }
-    out.truncate(5);
+    out.truncate(MAX_HASHTAGS);
     out
+}
+
+/// Ten relevant hashtags is a normal amount for a gaming video. YouTube shows the first three above
+/// the title and ignores every hashtag on a video that has more than 15.
+pub const MAX_HASHTAGS: usize = 10;
+
+/// Puts the call to action ("🔔 Like, comment and subscribe...") in a paragraph of its own, even when the
+/// AI wrote it straight after the last sentence.
+fn separate_call_to_action(intro: &str) -> String {
+    match intro.find('🔔') {
+        Some(at) if at > 0 && !intro[..at].trim_end_matches([' ', '\t']).ends_with('\n') => format!("{}\n\n{}", intro[..at].trim_end(), &intro[at..]),
+        _ => intro.to_string(),
+    }
 }
 
 /// Short bold text for a thumbnail: capitals, at most three words.
@@ -252,12 +275,12 @@ impl Pack {
             // The game or topic stays first; Shorts takes second place, inside the three YouTube shows above the title.
             hashtags.retain(|t| !t.eq_ignore_ascii_case("shorts"));
             hashtags.insert(1.min(hashtags.len()), "Shorts".into());
-            hashtags.truncate(5);
+            hashtags.truncate(MAX_HASHTAGS);
         }
         Ok(Pack {
             titles,
             title_pick: 0,
-            intro: tidy(&ai.intro.replace("\n\n", "\u{1}"), 900).replace('\u{1}', "\n\n"),
+            intro: tidy(&separate_call_to_action(&ai.intro).replace("\n\n", "\u{1}"), 900).replace('\u{1}', "\n\n"),
             // A Short has no chapters.
             chapters: if format == PackFormat::Short { Vec::new() } else { build_chapters(segments, &said) },
             hashtags,
@@ -335,15 +358,15 @@ impl Pack {
         let mut out: Vec<Check> = Vec::new();
         let mut add = |level: Level, text: String| out.push(Check { level, text });
         let title = self.titles.get(self.title_pick).map_or("", String::as_str);
-        let (n, good) = (title.chars().count(), if self.format == PackFormat::Short { 40 } else { 60 });
+        let (n, good) = (title.chars().count(), if self.format == PackFormat::Short { 50 } else { 60 });
         if n == 0 {
             add(Bad, "There is no title.".into());
         } else if n > MAX_TITLE {
             add(Bad, format!("The title is {n} characters, over YouTube's limit of {MAX_TITLE}."));
-        } else if n <= good {
+        } else if title_length(title) <= good {
             add(Good, format!("The title is {n} characters, short enough to show in full."));
         } else {
-            add(Warn, format!("The title is {n} characters and may be cut off in search results. Aim for {good} or fewer."));
+            add(Warn, format!("The title is {n} characters and may be cut off in search results. Aim for {good} or fewer, not counting hashtags at the end."));
         }
 
         let description = self.description();
@@ -373,10 +396,10 @@ impl Pack {
         }
 
         match self.hashtags.len() {
-            3..=5 => add(Good, format!("{} hashtags. YouTube shows the first three above the title.", self.hashtags.len())),
+            3..=MAX_HASHTAGS => add(Good, format!("{} hashtags. YouTube shows the first three above the title.", self.hashtags.len())),
             0 => add(Warn, "There are no hashtags.".into()),
-            1 | 2 => add(Warn, format!("Only {} hashtag(s). Three to five work well.", self.hashtags.len())),
-            more => add(Warn, format!("{more} hashtags is a lot. YouTube shows only the first three above the title, and over-tagging looks like spam.")),
+            1 | 2 => add(Warn, format!("Only {} hashtag(s). Three or more work well.", self.hashtags.len())),
+            more => add(Warn, format!("{more} hashtags is a lot. YouTube shows only the first three above the title, ignores them all above 15, and over-tagging looks like spam.")),
         }
         if self.format == PackFormat::Standard {
             if self.chapters.len() >= 3 {
@@ -705,11 +728,34 @@ mod tests {
     }
 
     #[test]
+    fn the_call_to_action_gets_its_own_paragraph() {
+        let glued = "Valorant clutch ends in a tense finish. 🎯🔥 🔔 Like, comment, and subscribe for more Valorant clips!";
+        let ai = AiPack { intro: glued.into(), titles: vec!["T".into()], ..ai(&["T"]) };
+        let pack = Pack::assemble(&ai, &[seg(0.0, "a")], vec![candidate(Path::new("a.mp4"), 1.0)], String::new(), PackFormat::Short).unwrap();
+        assert_eq!(pack.intro, "Valorant clutch ends in a tense finish. 🎯🔥\n\n🔔 Like, comment, and subscribe for more Valorant clips!");
+        // Already separate, or no call to action at all: left alone.
+        assert_eq!(separate_call_to_action("One.\n\n🔔 Like!"), "One.\n\n🔔 Like!");
+        assert_eq!(separate_call_to_action("Just one sentence."), "Just one sentence.");
+        assert_eq!(separate_call_to_action("🔔 Starts with it"), "🔔 Starts with it");
+    }
+
+    #[test]
+    fn trailing_hashtags_do_not_count_towards_the_title_length() {
+        let title = "🔥 INSANE VYSE + TEJO Combo on Sunset Map | Valorant Pro Play! 💥 #valorant #letsplay";
+        assert_eq!(title_length(title), "🔥 INSANE VYSE + TEJO Combo on Sunset Map | Valorant Pro Play! 💥".chars().count());
+        assert_eq!(title_length("Valorant #clutch in the middle"), "Valorant #clutch in the middle".chars().count(), "only hashtags at the end are left out");
+        assert_eq!(title_length("#"), 1, "a lone # is not a hashtag");
+        assert_eq!(title_length("#a #b"), 0);
+    }
+
+    #[test]
     fn titles_hashtags_and_thumbnail_text_are_cleaned() {
         let titles = clean_titles(&["  \"Title: I Won 1v5!\"  ".into(), "i won 1v5!".into(), "".into(), "B".into(), "C".into(), "D".into(), "x".repeat(300)]);
         assert_eq!(titles, vec!["I Won 1v5!".to_string(), "B".into(), "C".into()], "unique, tidy and at most three");
         assert!(clean_titles(&["y".repeat(300)])[0].chars().count() <= MAX_TITLE);
-        assert_eq!(clean_hashtags(&["#Gaming".into(), "clutch play".into(), "GAMING".into(), "!!".into(), "a".into(), "b".into(), "c".into(), "d".into()]), vec!["Gaming", "clutchplay", "a", "b", "c"]);
+        assert_eq!(clean_hashtags(&["#Gaming".into(), "clutch play".into(), "GAMING".into(), "!!".into(), "a".into(), "b".into(), "c".into(), "d".into()]), vec!["Gaming", "clutchplay", "a", "b", "c", "d"]);
+        let many: Vec<String> = (0..15).map(|i| format!("tag{i}")).collect();
+        assert_eq!(clean_hashtags(&many).len(), MAX_HASHTAGS, "capped, but a full gaming set fits");
         assert_eq!(clean_thumb_text("insane clutch!!! wow, really"), "INSANE CLUTCH!!! WOW");
         assert_eq!(wrap_thumb_text("INSANE CLUTCH"), "INSANE\nCLUTCH");
         assert_eq!(wrap_thumb_text("WOW"), "WOW");
@@ -932,10 +978,10 @@ mod tests {
         // A title that is too long and has no keyword; a description that never says it; too many hashtags.
         let long = "Absolutely Unbelievable Gameplay Moment That You Will Not Believe When You See What Happens Next".to_string();
         let mut p = pack(&long, "Something amazing happens here.");
-        p.hashtags = (0..8).map(|i| format!("tag{i}")).collect();
+        p.hashtags = (0..12).map(|i| format!("tag{i}")).collect();
         let text: Vec<String> = p.seo_checks().iter().filter(|c| c.level != Level::Good).map(|c| c.text.clone()).collect();
         let joined = text.join(" | ");
-        for needle in ["may be cut off", "not in the title", "not in the first 150", "never appears", "8 hashtags is a lot"] {
+        for needle in ["may be cut off", "not in the title", "not in the first 150", "never appears", "12 hashtags is a lot"] {
             assert!(joined.contains(needle), "missing '{needle}' in: {joined}");
         }
         // Over YouTube's hard limit is a failure, not a warning.
@@ -961,7 +1007,7 @@ mod tests {
         let short = Pack::assemble(&ai(&["One"]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], String::new(), PackFormat::Short).unwrap();
         assert!(short.chapters.is_empty());
         assert_eq!(short.hashtags[1], "Shorts", "the topic stays first and Shorts is inside the three YouTube shows: {:?}", short.hashtags);
-        assert!(short.hashtags.len() <= 5);
+        assert!(short.hashtags.len() <= MAX_HASHTAGS);
         assert!(!short.seo_checks().iter().any(|c| c.text.contains("chapter")), "a Short isn't checked for chapters");
         // A standard video keeps its chapters and gets no Shorts tag.
         let standard = Pack::assemble(&ai(&["One"]), &segments, vec![candidate(Path::new("a.mp4"), 1.0)], String::new(), PackFormat::Standard).unwrap();

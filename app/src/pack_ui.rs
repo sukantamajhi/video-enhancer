@@ -405,7 +405,7 @@ impl App {
                     });
 
                     let Some(pack) = &mut self.engine.publish.pack else { return };
-                    let good_len = if pack.format == PackFormat::Short { 40 } else { 60 };
+                    let good_len = if pack.format == PackFormat::Short { 50 } else { 60 };
                     ui.add_space(4.0);
                     theme::card(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -422,7 +422,7 @@ impl App {
                                 }
                                 let n = pack.titles[i].chars().count();
                                 ui.add(egui::TextEdit::singleline(&mut pack.titles[i]).desired_width(ui.available_width() - 140.0).margin(Margin::symmetric(10, 9)));
-                                let colour = if n == 0 || n > pack::MAX_TITLE { theme::BAD } else if n <= good_len { theme::OK } else { theme::WARN };
+                                let colour = if n == 0 || n > pack::MAX_TITLE { theme::BAD } else if pack::title_length(&pack.titles[i]) <= good_len { theme::OK } else { theme::WARN };
                                 theme::pill(ui, &format!("{n}/{}", pack::MAX_TITLE), colour, theme::tint(colour, 30), None);
                                 if theme::small_button(ui, "Copy").clicked() {
                                     copy = Some(pack.titles[i].clone());
